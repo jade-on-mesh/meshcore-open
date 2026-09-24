@@ -71,6 +71,25 @@ android {
                 keyPassword = keystoreProperties["keyPassword"] as String?
             }
         }
+        // Without key.properties (the normal case for this OTP dev build),
+        // the release build type used to fall back to the implicit "debug"
+        // signing config, which points at ~/.android/debug.keystore. That
+        // file doesn't exist on a fresh GitHub Actions runner, so the
+        // Android Gradle Plugin auto-generates a brand new one - with a
+        // brand new random key - on EVERY CI run. Two builds from two
+        // different runs therefore always have different signatures, and
+        // sideloading a newer build over an older one fails with "App not
+        // installed as package conflicts with existing package" even though
+        // applicationId never changed. otp-debug.keystore is a fixed,
+        // checked-in keystore (fine for a personal-sideload debug key, same
+        // trust model as the default debug key it replaces) so every build -
+        // CI or local - signs identically and can always upgrade in place.
+        create("otpDebug") {
+            storeFile = file("otp-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
@@ -78,7 +97,7 @@ android {
             signingConfig = if (keystorePropertiesFile.exists()) {
                 signingConfigs.getByName("release")
             } else {
-                signingConfigs.getByName("debug")
+                signingConfigs.getByName("otpDebug")
             }
             // ONNX Runtime resolves its Java classes from native code by name.
             // Without these rules R8 renames them and the process SIGABRTs with
