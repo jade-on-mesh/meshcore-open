@@ -8,12 +8,14 @@ import '../connector/meshcore_connector.dart';
 import '../models/channel.dart';
 import '../models/contact.dart';
 import '../models/otp_pad.dart';
+import '../models/otp_sync_status.dart';
 import '../services/otp_service.dart';
 import '../theme/mesh_theme.dart';
 import '../widgets/adaptive_app_bar_title.dart';
 import '../widgets/mesh_ui.dart';
 import '../widgets/qr_code_display.dart';
 import '../widgets/qr_scanner_widget.dart';
+import 'otp_lock_screen.dart';
 
 /// Pad management screen for a contact or a channel — import via paste or
 /// QR scan, pick A/B role, see live consumption, replace or clear.
@@ -73,9 +75,31 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       appBar: AppBar(
         title: AdaptiveAppBarTitle('OTP Pad — $_targetName'),
         centerTitle: true,
+        actions: [
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) => IconButton(
+              tooltip: connector.otpProtectionEnabled
+                  ? (connector.otpLocked ? 'Unlock OTP pads' : 'OTP protection')
+                  : 'Set up passphrase protection',
+              icon: Icon(
+                !connector.otpProtectionEnabled
+                    ? Icons.shield_outlined
+                    : (connector.otpLocked
+                          ? Icons.lock
+                          : Icons.lock_open),
+              ),
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const OtpLockScreen()),
+              ),
+            ),
+          ),
+        ],
       ),
       body: Consumer<MeshCoreConnector>(
         builder: (context, connector, _) {
+          if (connector.otpLocked) {
+            return _buildLockedBody(context);
+          }
           final pad = _currentPad(connector);
           return ListView(
             padding: const EdgeInsets.only(bottom: 32),
@@ -84,6 +108,10 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               if (pad != null) ...[
                 const SectionHeader('Pad usage'),
                 _buildUsageCard(context, connector, pad),
+                const SectionHeader('Fingerprint'),
+                _buildFingerprintCard(context, pad),
+                const SectionHeader('Sync check'),
+                _buildSyncCard(context, connector, pad),
                 const SectionHeader('Manage'),
                 _buildManageCard(context, connector, pad),
               ] else ...[
@@ -94,6 +122,57 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
           );
         },
       ),
+    );
+  }
+
+  // ── Locked placeholder ──────────────────────────────────────────────
+
+  Widget _buildLockedBody(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        MeshCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.lock, color: MeshPalette.warn),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'OTP pads are locked',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Enter your passphrase to manage this pad. Nothing else in '
+                'the app is affected by this lock.',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const OtpLockScreen()),
+                  ),
+                  icon: const Icon(Icons.lock_open),
+                  label: const Text('Unlock'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -336,6 +415,203 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  // ── Fingerprint card ─────────────────────────────────────────────────
+  // A short, human-comparable hash of the FULL pad — shown right after
+  // import AND re-viewable any time from here, so a device that imported
+  // via QR (or whose partner scanned it a moment later) can always come
+  // back and read this aloud to compare. See OtpPad.fingerprint.
+
+  Widget _buildFingerprintCard(BuildContext context, OtpPad pad) {
+    final scheme = Theme.of(context).colorScheme;
+    return MeshCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.fingerprint, color: MeshPalette.blue),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Pad fingerprint',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Copy',
+                icon: const Icon(Icons.copy, size: 18),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: pad.fingerprint));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Fingerprint copied')),
+                  );
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SelectableText(
+            pad.fingerprint,
+            style: const TextStyle(
+              fontFamily: 'monospace',
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.5,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Compare this with what shows on the other person\'s screen — '
+            'if they don\'t match exactly, don\'t use this pad, something '
+            'intercepted your QR code.',
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Sync-check card ──────────────────────────────────────────────────
+  // New feature (no Lua equivalent): confirms both sides' pad offsets
+  // haven't drifted apart, without spending any pad bytes — see
+  // otp_sync_service.dart / MeshCoreConnector.checkContactPadSync.
+
+  Widget _buildSyncCard(
+    BuildContext context,
+    MeshCoreConnector connector,
+    OtpPad pad,
+  ) {
+    if (_isChannel) {
+      final statuses = connector.getChannelOtpSyncStatuses(
+        widget.channel!.index,
+      );
+      return MeshCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Check every participant is at the same offset',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () =>
+                      connector.checkChannelPadSync(widget.channel!.index),
+                  icon: const Icon(Icons.sync, size: 18),
+                  label: const Text('Check sync'),
+                ),
+              ],
+            ),
+            if (statuses.isNotEmpty) ...[
+              const Divider(height: 20),
+              ...statuses.entries.map(
+                (e) => _syncStatusRow(context, e.key, e.value),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+    final status = connector.getContactOtpSyncStatus(
+      widget.contact!.publicKeyHex,
+    );
+    return MeshCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Confirm your offsets haven\'t drifted apart',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+              OutlinedButton.icon(
+                onPressed: () =>
+                    connector.checkContactPadSync(widget.contact!.publicKeyHex),
+                icon: const Icon(Icons.sync, size: 18),
+                label: const Text('Check sync'),
+              ),
+            ],
+          ),
+          if (status != null) ...[
+            const Divider(height: 20),
+            _syncStatusRow(context, _targetName, status),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _syncStatusRow(
+    BuildContext context,
+    String label,
+    OtpSyncStatus status,
+  ) {
+    final Color color;
+    final IconData icon;
+    final String text;
+    if (status.inSync == true) {
+      color = MeshPalette.blue;
+      icon = Icons.check_circle_outline;
+      text = 'In sync';
+    } else if (status.inSync == false) {
+      color = MeshPalette.alert;
+      icon = Icons.warning_amber_rounded;
+      final drift = status.driftBytes?.abs() ?? 0;
+      final direction = status.driftDirection == 'mine-ahead'
+          ? 'you are ahead'
+          : 'they are ahead';
+      text = 'Out of sync — drifted by $drift bytes ($direction)';
+    } else if (status.timedOut) {
+      color = MeshPalette.warn;
+      icon = Icons.help_outline;
+      text = 'No reply — unknown (they may not support sync-check, or are offline)';
+    } else {
+      color = MeshPalette.warn;
+      icon = Icons.hourglass_top;
+      text = 'Checking…';
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_isChannel)
+                  Text(
+                    label,
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                Text(
+                  text,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(color: color),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -679,6 +955,50 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     setState(() => _busy = false);
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('OTP pad imported and enabled')),
+    );
+    // Show the fingerprint immediately, prominently, right after import —
+    // the whole point is to catch a swapped/tampered QR code before either
+    // side sends anything, and the other person may be ready to compare
+    // right now.
+    final pad = _currentPad(connector);
+    if (pad != null) _showFingerprintDialog(pad);
+  }
+
+  void _showFingerprintDialog(OtpPad pad) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.fingerprint, color: MeshPalette.blue, size: 32),
+        title: const Text('Compare this fingerprint'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SelectableText(
+              pad.fingerprint,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 22,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5,
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              "Read this to the other person (or compare with what's on "
+              "their screen). If it doesn't match EXACTLY, don't use this "
+              'pad — something intercepted or substituted your QR code.',
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Got it'),
+          ),
+        ],
+      ),
     );
   }
 

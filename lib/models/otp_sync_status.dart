@@ -1,0 +1,71 @@
+/// Result of the most recent pad sync-check exchange with one peer — a
+/// contact's DM pad, or one participant of a channel's shared pad.
+///
+/// [inSync] is deliberately nullable with three real states, not a bool:
+///   - `null`  — unknown: no sync-check has been run yet, or one is still
+///     awaiting a reply (see [timedOut] to tell those two apart).
+///   - `true`  — the peer's reported counters matched what this device
+///     expects.
+///   - `false` — they didn't; see [driftBytes]/[driftDirection].
+class OtpSyncStatus {
+  /// When THIS device last sent (or received, for the responding side's own
+  /// bookkeeping) a sync-check for this peer.
+  final DateTime checkedAt;
+
+  /// When a reply (or, for the receiving side, the triggering message
+  /// itself) was last processed. Null while a just-sent check is still
+  /// awaiting its reply.
+  final DateTime? repliedAt;
+
+  /// True once [checkedAt] is old enough that a reply is no longer
+  /// expected. Left as "unknown" (not "out of sync") — see the class doc.
+  final bool timedOut;
+
+  final bool? inSync;
+
+  /// Signed byte drift, only meaningful when [inSync] is false. Positive
+  /// means this device's counter is ahead of the peer's; negative means the
+  /// peer is ahead. (See [driftDirection] for the human-readable form.)
+  final int? driftBytes;
+
+  /// `'mine-ahead'`, `'theirs-ahead'`, or null (in sync / unknown).
+  final String? driftDirection;
+
+  const OtpSyncStatus({
+    required this.checkedAt,
+    this.repliedAt,
+    this.timedOut = false,
+    this.inSync,
+    this.driftBytes,
+    this.driftDirection,
+  });
+
+  /// Still waiting on a reply to a check this device sent.
+  bool get isPending => repliedAt == null && !timedOut;
+
+  OtpSyncStatus copyWith({
+    DateTime? checkedAt,
+    Object? repliedAt = _unset,
+    bool? timedOut,
+    Object? inSync = _unset,
+    Object? driftBytes = _unset,
+    Object? driftDirection = _unset,
+  }) {
+    return OtpSyncStatus(
+      checkedAt: checkedAt ?? this.checkedAt,
+      repliedAt: repliedAt == _unset
+          ? this.repliedAt
+          : repliedAt as DateTime?,
+      timedOut: timedOut ?? this.timedOut,
+      inSync: inSync == _unset ? this.inSync : inSync as bool?,
+      driftBytes: driftBytes == _unset
+          ? this.driftBytes
+          : driftBytes as int?,
+      driftDirection: driftDirection == _unset
+          ? this.driftDirection
+          : driftDirection as String?,
+    );
+  }
+
+  static const Object _unset = Object();
+}

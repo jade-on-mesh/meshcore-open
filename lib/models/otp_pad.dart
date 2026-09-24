@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import '../connector/meshcore_protocol.dart' show hex2Uint8List;
 
 /// Which half of a shared pad this device sends from.
@@ -71,9 +73,14 @@ enum OtpPadMode {
 /// A shared one-time pad plus this device's consumption state for one
 /// contact or one channel.
 ///
-/// Deliberately stored unencrypted (matches every other per-contact /
+/// Stored unencrypted by default (matches every other per-contact /
 /// per-channel setting in this app, which all live in plain
-/// SharedPreferences) — this is a product decision, not an oversight.
+/// SharedPreferences) — a deliberate product decision, not an oversight —
+/// UNLESS the OTP passphrase-lock feature has been enabled, in which case
+/// [OtpPadStore] transparently wraps the persisted JSON in real
+/// authenticated encryption (see `OtpPadStore`/`PassphraseLockCrypto`).
+/// Nothing about this in-memory class changes either way; only how the
+/// store serializes it does.
 class OtpPad {
   /// The full shared pad, as lowercase hex. Never transmitted after import;
   /// only ever consumed locally to derive per-message key material.
@@ -123,6 +130,33 @@ class OtpPad {
   });
 
   bool get isSharedSequential => mode == OtpPadMode.sharedSequential;
+
+  /// A short, human-comparable fingerprint of the FULL pad — meant to be
+  /// read aloud (or eyeballed) right after import and compared against
+  /// what shows on the other person's screen, to catch a QR code that was
+  /// swapped/tampered with in transit. Pure function of [padHex], so it's
+  /// never persisted separately — it's recomputed on demand anywhere it's
+  /// shown (the import screen, and again later from the pad manager).
+  ///
+  /// Presentation: the first 16 hex characters (8 bytes) of
+  /// `SHA-256(padBytes)`, grouped into 4-character blocks
+  /// (`"a3f9 2c81 44de f001"`). Chosen over a wordlist/safety-number-style
+  /// scheme (like Signal's) because it's trivial to implement correctly
+  /// without a toolchain to test against, still easy to read aloud or eyeball
+  /// character-by-character, and 8 bytes of SHA-256 (2^64 space) is already
+  /// astronomically hard to find a colliding pad prefix for.
+  String get fingerprint {
+    final digest = crypto.sha256.convert(hex2Uint8List(padHex));
+    final hex = digest.bytes
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join()
+        .substring(0, 16);
+    final groups = <String>[];
+    for (var i = 0; i < hex.length; i += 4) {
+      groups.add(hex.substring(i, i + 4));
+    }
+    return groups.join(' ');
+  }
 
   int get totalBytes => padHex.length ~/ 2;
   int get halfBytes => totalBytes ~/ 2;

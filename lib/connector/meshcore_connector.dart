@@ -15,15 +15,19 @@ import '../models/companion_radio_stats.dart';
 import '../models/contact.dart';
 import '../models/message.dart';
 import '../models/otp_pad.dart';
+import '../models/otp_sync_status.dart';
 import '../models/path_selection.dart';
 import '../models/translation_support.dart';
 import '../helpers/reaction_helper.dart';
 import '../helpers/cyr2lat.dart';
 import '../helpers/smaz.dart';
 import '../storage/otp_pad_store.dart';
+import '../storage/passphrase_lock_store.dart';
 import '../services/app_debug_log_service.dart';
 import '../services/otp_service.dart';
 import '../services/otp_chunk_service.dart';
+import '../services/otp_sync_service.dart';
+import '../services/passphrase_lock_service.dart';
 import '../services/ble_debug_log_service.dart';
 import '../services/linux_ble_error_classifier.dart';
 import '../services/linux_ble_pairing_service_stub.dart'
@@ -428,6 +432,21 @@ class MeshCoreConnector extends ChangeNotifier {
   // re-consuming pad for it. Shares _otpDecryptCache's FIFO trimming since
   // an entry only exists here while it also exists there.
   final Map<String, ({int tid, int idx})> _otpChunkHexIndex = {};
+  // ── OTP passphrase lock (Feature: passphrase lock + panic wipe) ──────
+  final PassphraseLockStore _passphraseLockStore = PassphraseLockStore();
+  // Held only in memory, only for this session — never persisted (matches
+  // Lua's `session_key`). Non-null exactly when protection is enabled AND
+  // unlocked; see otpProtectionEnabled/otpLocked.
+  Uint8List? _otpSessionKey;
+  bool _otpPanicArmed = false;
+  DateTime? _otpPanicArmedAt;
+  static const Duration _otpPanicConfirmWindow = Duration(seconds: 4);
+  // ── OTP pad sync-check (Feature: pad sync-check) ──────────────────────
+  final Map<String, OtpSyncStatus> _contactOtpSyncStatus = {};
+  // channelIndex -> senderName -> status for that participant.
+  final Map<int, Map<String, OtpSyncStatus>> _channelOtpSyncStatus = {};
+  final Map<String, Timer> _otpSyncTimeoutTimers = {};
+  static const Duration _otpSyncTimeout = Duration(seconds: 20);
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
@@ -989,6 +1008,349 @@ class MeshCoreConnector extends ChangeNotifier {
     _channelOtpPads[channelIndex] = null;
     await _otpPadStore.clearChannelPad(channelIndex);
     notifyListeners();
+  }
+
+  // ── OTP passphrase lock + panic wipe ─────────────────────────────────
+  // Ported from WADAMESH OTP_2_RC15.lua's protection design (HMAC-SHA256
+  // KDF, 3001 rounds, random 16-byte salt, fixed check-tag domain string —
+  // see PassphraseLockCrypto). Scope decision (this app's own, not Lua's):
+  // this gates the OTP pad-manager screen and, transitively, OTP pad
+  // decrypt — NOT the whole app. Lua is a single-purpose OTP messenger
+  // where a full-app lock screen is the only sensible design; this is a
+  // general multi-contact MeshCore companion app where OTP is already an
+  // opt-in per-contact/per-channel feature layered on top of otherwise-
+  // normal messaging, so locking browsing contacts/channels/non-OTP chat
+  // behind a passphrase would be needless friction the app's owner did not
+  // ask for. The gating mechanism itself needs no extra "is locked" checks
+  // scattered through the send/receive paths: while locked, OtpPadStore
+  // simply can't decrypt a persisted pad blob (see its `sessionKey`), so
+  // getContactOtpPad/getChannelOtpPad transparently return null and OTP
+  // behaves as "not enabled" for that contact/channel until unlocked —
+  // incoming ciphertext is left showing as raw hex (never mis-decrypted,
+  // and never consumes pad bytes) rather than being displayed as plaintext.
+
+  /// True once a passphrase has ever been set up (salt+tag persisted) —
+  /// independent of whether the session is currently locked or unlocked.
+  bool get otpProtectionEnabled => _passphraseLockStore.hasProtection;
+
+  /// True when protection is enabled but this session doesn't (yet) hold
+  /// the derived session key — i.e. OTP pads are currently inaccessible.
+  bool get otpLocked => otpProtectionEnabled && _otpSessionKey == null;
+
+  /// True for the ~4s window after a single "panic wipe" tap, during which
+  /// a second tap confirms the wipe. The pad-manager/lock UI should show
+  /// "tap again to confirm" while this is true.
+  bool get otpPanicArmed {
+    final armedAt = _otpPanicArmedAt;
+    if (!_otpPanicArmed || armedAt == null) return false;
+    if (DateTime.now().difference(armedAt) > _otpPanicConfirmWindow) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Sets up passphrase protection for the first time (or replaces it,
+  /// though the UI should route a "change passphrase" flow through this the
+  /// same way — there is no separate re-key path). Generates a fresh random
+  /// salt, derives the session key from [passphrase], persists salt+tag
+  /// (never the key or the passphrase), unlocks immediately with the new
+  /// key, and re-encrypts every pad already on disk under it.
+  Future<void> enableOtpProtection(String passphrase) async {
+    final salt = PassphraseLockCrypto.randomSalt();
+    final key = PassphraseLockCrypto.deriveKey(passphrase, salt);
+    final tag = PassphraseLockCrypto.checkTag(key);
+    await _passphraseLockStore.save(
+      saltHex: OtpService.bytesToHex(salt),
+      tagHex: tag,
+    );
+    _otpSessionKey = key;
+    _otpPadStore.sessionKey = key;
+    // Force every pad already cached in memory (plaintext, from before
+    // protection existed) to reload from disk next time it's asked for —
+    // migrateAllToEncrypted below re-saves the on-disk copies directly, so
+    // this just keeps the in-memory cache from serving a stale (unencrypted
+    // in spirit, though harmless in memory) copy instead of the fresh one.
+    _contactOtpPads.clear();
+    _channelOtpPads.clear();
+    await _otpPadStore.migrateAllToEncrypted();
+    notifyListeners();
+  }
+
+  /// Attempts to unlock with [passphrase]. Returns true and makes pads
+  /// accessible again on a match; returns false (stays locked) on a
+  /// mismatch. No-op (returns false) if protection was never enabled.
+  Future<bool> unlockOtpProtection(String passphrase) async {
+    final saltHex = _passphraseLockStore.loadSaltHex();
+    final tagHex = _passphraseLockStore.loadTagHex();
+    if (saltHex == null || tagHex == null) return false;
+    final Uint8List salt;
+    try {
+      salt = hex2Uint8List(saltHex);
+    } catch (_) {
+      return false;
+    }
+    final key = PassphraseLockCrypto.deriveKey(passphrase, salt);
+    if (PassphraseLockCrypto.checkTag(key) != tagHex) return false;
+    _otpSessionKey = key;
+    _otpPadStore.sessionKey = key;
+    // MUST clear these: while locked, a lookup for any pad that only exists
+    // encrypted on disk was cached here as `null` ("no pad"). Without this
+    // clear, that stale null would keep shadowing the real pad forever,
+    // even after a correct unlock.
+    _contactOtpPads.clear();
+    _channelOtpPads.clear();
+    notifyListeners();
+    return true;
+  }
+
+  /// Re-locks without touching any stored data — the opposite of
+  /// [unlockOtpProtection]. No-op if protection isn't enabled.
+  void lockOtpProtection() {
+    if (!otpProtectionEnabled || _otpSessionKey == null) return;
+    _otpSessionKey = null;
+    _otpPadStore.sessionKey = null;
+    _contactOtpPads.clear();
+    _channelOtpPads.clear();
+    notifyListeners();
+  }
+
+  /// Single tap arms the panic wipe and returns false (caller should show
+  /// "tap again within 4s to confirm"); a second tap within
+  /// [_otpPanicConfirmWindow] confirms it, performs the wipe, and returns
+  /// true. Matches Lua exactly: wipes every pad, clears the stored
+  /// salt/tag, and drops the session key — protection ends up fully
+  /// DISABLED afterward (this is "destroy the secrets AND the lock", not
+  /// "wipe secrets but stay locked").
+  Future<bool> tapOtpPanicWipe() async {
+    final now = DateTime.now();
+    final armedAt = _otpPanicArmedAt;
+    if (_otpPanicArmed &&
+        armedAt != null &&
+        now.difference(armedAt) <= _otpPanicConfirmWindow) {
+      _otpPanicArmed = false;
+      _otpPanicArmedAt = null;
+      await _otpPadStore.wipeAllPads();
+      _contactOtpPads.clear();
+      _channelOtpPads.clear();
+      await _passphraseLockStore.clear();
+      _otpSessionKey = null;
+      _otpPadStore.sessionKey = null;
+      notifyListeners();
+      return true;
+    }
+    _otpPanicArmed = true;
+    _otpPanicArmedAt = now;
+    notifyListeners();
+    return false;
+  }
+
+  /// Cancels an armed-but-unconfirmed panic wipe (e.g. the user navigated
+  /// away, or just tapped by accident).
+  void cancelOtpPanicWipe() {
+    if (!_otpPanicArmed) return;
+    _otpPanicArmed = false;
+    _otpPanicArmedAt = null;
+    notifyListeners();
+  }
+
+  // ── OTP pad sync-check ────────────────────────────────────────────────
+  // New (no Lua equivalent): a lightweight, user-triggered exchange of pad
+  // POSITION COUNTERS ONLY — never pad bytes — to confirm two devices'
+  // offsets haven't drifted apart, without spending any pad. See
+  // otp_sync_service.dart for the wire format and the receive-path hooks in
+  // _parseContactMessage/_handleIncomingChannelMessage/_handleLogRxData for
+  // where OTPSYNC1| messages are intercepted before OTP dispatch.
+
+  OtpSyncStatus? getContactOtpSyncStatus(String contactKeyHex) =>
+      _contactOtpSyncStatus[contactKeyHex];
+
+  /// Per-participant sync status for a channel, keyed by sender display
+  /// name (channel messages don't carry a resolvable sender public key —
+  /// see the identical reasoning already documented on
+  /// `_ackChunkFromChannelSender`).
+  Map<String, OtpSyncStatus> getChannelOtpSyncStatuses(int channelIndex) =>
+      Map.unmodifiable(_channelOtpSyncStatus[channelIndex] ?? const {});
+
+  /// Sends a sync-check request to [contactKeyHex]'s DM pad, reporting this
+  /// device's own current counters. A reply (see
+  /// _maybeHandleContactSyncMessage) updates [getContactOtpSyncStatus]; if
+  /// nothing comes back within [_otpSyncTimeout], the status is left/marked
+  /// as timed-out (unknown), never falsely "in sync" or "out of sync".
+  void checkContactPadSync(String contactKeyHex) {
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) return;
+    final contact = _contacts.cast<Contact?>().firstWhere(
+      (c) => c != null && c.publicKeyHex == contactKeyHex,
+      orElse: () => null,
+    );
+    if (contact == null) return;
+    final payload = pad.isSharedSequential
+        ? OtpSyncService.buildShared(isReply: false, offset: pad.offset)
+        : OtpSyncService.buildTwoParty(
+            isReply: false,
+            myOffset: pad.myOffset,
+            theirOffset: pad.theirOffset,
+          );
+    unawaited(
+      sendFrame(
+        buildSendTextMsgFrame(
+          contact.publicKey,
+          prepareContactOutboundText(contact, payload),
+        ),
+      ),
+    );
+    _contactOtpSyncStatus[contactKeyHex] = OtpSyncStatus(
+      checkedAt: DateTime.now(),
+    );
+    _armOtpSyncTimeout('c:$contactKeyHex', () {
+      final status = _contactOtpSyncStatus[contactKeyHex];
+      if (status != null && status.isPending) {
+        _contactOtpSyncStatus[contactKeyHex] = status.copyWith(
+          timedOut: true,
+        );
+        notifyListeners();
+      }
+    });
+    notifyListeners();
+  }
+
+  /// Sends a sync-check to a channel — broadcast, since this is metadata
+  /// only (never secret): every current participant that has this feature
+  /// replies once, so one broadcast naturally populates
+  /// [getChannelOtpSyncStatuses] for everyone who answers, not just the
+  /// initiator.
+  void checkChannelPadSync(int channelIndex) {
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) return;
+    final payload = OtpSyncService.buildShared(
+      isReply: false,
+      offset: pad.offset,
+    );
+    unawaited(
+      sendFrame(
+        buildSendChannelTextMsgFrame(
+          channelIndex,
+          prepareChannelOutboundText(channelIndex, payload),
+        ),
+      ),
+    );
+    _armOtpSyncTimeout('s:$channelIndex', () {
+      // Per-participant entries carry their own pending/timedOut state
+      // (set as each reply — or lack of one — is processed); this timer
+      // just nudges listeners so a UI showing "waiting…" for the channel
+      // as a whole knows the initial window has closed.
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  void _armOtpSyncTimeout(String key, void Function() onTimeout) {
+    _otpSyncTimeoutTimers[key]?.cancel();
+    _otpSyncTimeoutTimers[key] = Timer(_otpSyncTimeout, onTimeout);
+  }
+
+  /// Returns true if [text] was an `OTPSYNC1|` control message (handled
+  /// here, including sending the automatic reply) and must NOT be shown as
+  /// a chat message — mirrors how a chunk piece/ack "handled" result
+  /// suppresses display in [_dispatchOtpContact].
+  bool _maybeHandleContactSyncMessage(Contact contact, String text) {
+    if (!OtpSyncService.looksLikeSyncMessage(text)) return false;
+    final payload = OtpSyncService.parse(text);
+    if (payload == null) return true;
+    final pad = getContactOtpPad(contact.publicKeyHex);
+    if (pad != null &&
+        !pad.isSharedSequential &&
+        !payload.isSharedSequential) {
+      final peerMyOffset = payload.myOffset ?? 0;
+      final peerTheirOffset = payload.theirOffset ?? 0;
+      // In sync iff: what THEY say they've sent (their myOffset) matches
+      // how much of THEIRS I've decrypted (my theirOffset), AND what THEY
+      // say they've decrypted of MINE (their theirOffset) matches how much
+      // I've actually sent (my myOffset). A brief, benign mismatch right
+      // after a send (before the peer has decrypted it yet) is expected —
+      // this is a diagnostic signal, not a hard correctness guarantee.
+      final drift = pad.theirOffset - peerMyOffset;
+      final otherDrift = pad.myOffset - peerTheirOffset;
+      final inSync = drift == 0 && otherDrift == 0;
+      final primaryDrift = drift != 0 ? drift : otherDrift;
+      _contactOtpSyncStatus[contact.publicKeyHex] = OtpSyncStatus(
+        checkedAt:
+            _contactOtpSyncStatus[contact.publicKeyHex]?.checkedAt ??
+            DateTime.now(),
+        repliedAt: DateTime.now(),
+        inSync: inSync,
+        driftBytes: inSync ? 0 : primaryDrift,
+        driftDirection: inSync
+            ? null
+            : (primaryDrift > 0 ? 'mine-ahead' : 'theirs-ahead'),
+      );
+    }
+    if (!payload.isReply && pad != null) {
+      final reply = pad.isSharedSequential
+          ? OtpSyncService.buildShared(isReply: true, offset: pad.offset)
+          : OtpSyncService.buildTwoParty(
+              isReply: true,
+              myOffset: pad.myOffset,
+              theirOffset: pad.theirOffset,
+            );
+      unawaited(
+        sendFrame(
+          buildSendTextMsgFrame(
+            contact.publicKey,
+            prepareContactOutboundText(contact, reply),
+          ),
+        ),
+      );
+    }
+    notifyListeners();
+    return true;
+  }
+
+  /// Channel counterpart of [_maybeHandleContactSyncMessage]. [senderName]
+  /// identifies the participant this counter belongs to (see
+  /// [getChannelOtpSyncStatuses] doc).
+  bool _maybeHandleChannelSyncMessage(
+    int channelIndex,
+    String senderName,
+    String text,
+  ) {
+    if (!OtpSyncService.looksLikeSyncMessage(text)) return false;
+    final payload = OtpSyncService.parse(text);
+    if (payload == null) return true;
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad != null && payload.isSharedSequential) {
+      final peerOffset = payload.offset ?? 0;
+      final drift = pad.offset - peerOffset;
+      final perChannel = _channelOtpSyncStatus.putIfAbsent(
+        channelIndex,
+        () => {},
+      );
+      perChannel[senderName] = OtpSyncStatus(
+        checkedAt: perChannel[senderName]?.checkedAt ?? DateTime.now(),
+        repliedAt: DateTime.now(),
+        inSync: drift == 0,
+        driftBytes: drift,
+        driftDirection: drift == 0
+            ? null
+            : (drift > 0 ? 'mine-ahead' : 'theirs-ahead'),
+      );
+    }
+    if (!payload.isReply && pad != null) {
+      final reply = OtpSyncService.buildShared(
+        isReply: true,
+        offset: pad.offset,
+      );
+      unawaited(
+        sendFrame(
+          buildSendChannelTextMsgFrame(
+            channelIndex,
+            prepareChannelOutboundText(channelIndex, reply),
+          ),
+        ),
+      );
+    }
+    notifyListeners();
+    return true;
   }
 
   // ── OTP pad consumption ──────────────────────────────────────────────
@@ -6460,6 +6822,11 @@ class MeshCoreConnector extends ChangeNotifier {
       // ack has nothing to show yet, so the whole incoming frame is
       // suppressed (return null) rather than turned into a visible message.
       if (!isCli) {
+        // Pad sync-check control messages are sent in the clear (never OTP
+        // ciphertext) and must never appear as a chat bubble — checked
+        // before OTP dispatch so this works even when OTP isn't (or isn't
+        // yet) enabled for this contact.
+        if (_maybeHandleContactSyncMessage(contact, decodedText)) return null;
         final otpResult = _dispatchOtpContact(contact, decodedText);
         if (otpResult.handled) {
           if (otpResult.displayText == null) return null;
@@ -6612,6 +6979,7 @@ class MeshCoreConnector extends ChangeNotifier {
         trimmed.startsWith('g:') ||
         trimmed.startsWith('m:') ||
         trimmed.startsWith('V1|') ||
+        OtpSyncService.looksLikeSyncMessage(trimmed) ||
         (isContactOtpEnabled(contact.publicKeyHex) &&
             OtpService.looksLikeCiphertextHex(trimmed));
     if (!isStructuredPayload) {
@@ -6645,6 +7013,7 @@ class MeshCoreConnector extends ChangeNotifier {
     final isStructuredPayload =
         trimmed.startsWith('g:') ||
         trimmed.startsWith('m:') ||
+        OtpSyncService.looksLikeSyncMessage(trimmed) ||
         (isChannelOtpEnabled(channelIndex) &&
             OtpService.looksLikeCiphertextHex(trimmed));
     if (!isStructuredPayload) {
@@ -6737,6 +7106,17 @@ class MeshCoreConnector extends ChangeNotifier {
     var parsed = ChannelMessage.fromFrame(frame);
     if (parsed != null && parsed.channelIndex != null) {
       if (_shouldDropSelfChannelMessage(parsed.senderName, parsed.pathBytes)) {
+        return;
+      }
+      // Pad sync-check control messages (see the note in
+      // _parseContactMessage) — checked before OTP dispatch, same reasoning.
+      if (_maybeHandleChannelSyncMessage(
+        parsed.channelIndex!,
+        parsed.senderName,
+        parsed.text,
+      )) {
+        _lastChannelMsgRxTime = DateTime.now();
+        _handleQueuedMessageReceived();
         return;
       }
       // OTP: decrypt (and, for a chunk piece or ack, dispatch) in place,
@@ -6839,6 +7219,17 @@ class MeshCoreConnector extends ChangeNotifier {
           }
 
           var decodedText = Smaz.tryDecodePrefixed(parsed.text) ?? parsed.text;
+
+          // Pad sync-check control messages — same reasoning as the
+          // _handleIncomingChannelMessage hook; this is the second,
+          // independent channel-receive path, so it needs the same check.
+          if (_maybeHandleChannelSyncMessage(
+            channel.index,
+            parsed.senderName,
+            decodedText,
+          )) {
+            return;
+          }
 
           // OTP: this is the second, independent channel-receive path (raw
           // RX log data, decoded straight from the channel PSK rather than
@@ -8028,6 +8419,9 @@ class MeshCoreConnector extends ChangeNotifier {
     _batteryPollTimer?.cancel();
     _gpsLocationPollTimer?.cancel();
     _radioStatsPollTimer?.cancel();
+    for (final timer in _otpSyncTimeoutTimers.values) {
+      timer.cancel();
+    }
     radioStatsNotifier.dispose();
     _receivedFramesController.close();
     _usbManager.dispose();
