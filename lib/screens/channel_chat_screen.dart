@@ -184,6 +184,9 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
   void _onTextFieldFocusChange() {
     if (_textFieldFocusNode.hasFocus && mounted) {
       _scrollController.handleKeyboardOpen();
+      // About to send into this channel's pad — check it's still in
+      // sync now, before any bytes get spent.
+      _connector?.notifyComposeStartedForChannel(widget.channel.index);
     }
   }
 

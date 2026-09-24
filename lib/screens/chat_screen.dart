@@ -160,6 +160,10 @@ class _ChatScreenState extends State<ChatScreen> {
   void _onTextFieldFocusChange() {
     if (_textFieldFocusNode.hasFocus && mounted) {
       _scrollController.handleKeyboardOpen();
+      // About to type a reply — check the pad's still in sync now,
+      // before any bytes get spent, rather than only finding out after
+      // a send fails to decrypt on the other end.
+      _connector?.notifyComposeStartedForContact(widget.contact.publicKeyHex);
     }
   }
 

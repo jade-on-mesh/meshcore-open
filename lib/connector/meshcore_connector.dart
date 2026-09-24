@@ -476,7 +476,7 @@ class MeshCoreConnector extends ChangeNotifier {
   _pendingChannelResync = {};
   final Map<String, Timer> _otpResyncTimers = {};
   Timer? _otpAutoSyncPollTimer;
-  static const Duration _otpAutoSyncPollInterval = Duration(seconds: 30);
+  static const Duration _otpAutoSyncPollInterval = Duration(seconds: 120);
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
@@ -1051,6 +1051,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _pendingContactResync.remove(contactKeyHex);
     _otpResyncTimers.remove('rc:$contactKeyHex')?.cancel();
     _otpSyncTimeoutTimers.remove('c:$contactKeyHex')?.cancel();
+    _lastPromptSyncCheckAt.remove('c:$contactKeyHex');
   }
 
   void _clearChannelSyncState(int channelIndex) {
@@ -1063,6 +1064,7 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     perChannel?.clear();
     _otpSyncTimeoutTimers.remove('s:$channelIndex')?.cancel();
+    _lastPromptSyncCheckAt.remove('s:$channelIndex');
   }
 
   // ── OTP passphrase lock + panic wipe ─────────────────────────────────
@@ -1530,10 +1532,24 @@ class MeshCoreConnector extends ChangeNotifier {
   // Runs alongside battery polling (see the calls next to
   // _startBatteryPolling/_stopBatteryPolling) so it shares the same
   // connected-device lifecycle without a separate connect/disconnect path
-  // to keep in sync. Checks every contact/channel with OTP enabled, not
-  // just whichever one the person currently has open — this app can be
-  // backgrounded, so "only check what's on screen" would miss drift on
-  // every other conversation.
+  // to keep in sync.
+  //
+  // Deliberately scoped to ONLY whichever contact/channel screen is
+  // currently open (_activeContactKey/_activeChannelIndex — the same
+  // state ChatScreen/ChannelChatScreen already set on
+  // setActiveContact/setActiveChannel for unread tracking), not every
+  // OTP-enabled contact/channel in the address book. A sync-check is a
+  // real mesh transmission, and this app can be running with dozens of
+  // OTP contacts/channels configured but only ever one conversation open
+  // at a time — polling all of them on a timer would multiply airtime
+  // use by however many pads exist, for conversations nobody is
+  // currently looking at. The tradeoff: drift in a conversation that
+  // isn't open right now won't be caught until it's opened again (which
+  // itself triggers an immediate check — see setActiveContact/
+  // setActiveChannel below) or a message is sent/received in it (which
+  // also triggers one — see _requestPromptContactSyncCheck/
+  // _requestPromptChannelSyncCheck). Nothing is ever silently wrong for
+  // longer than "until you open that chat."
   void _startOtpAutoSyncPolling() {
     _otpAutoSyncPollTimer?.cancel();
     _otpAutoSyncPollTimer = Timer.periodic(_otpAutoSyncPollInterval, (timer) {
@@ -1541,7 +1557,7 @@ class MeshCoreConnector extends ChangeNotifier {
         timer.cancel();
         return;
       }
-      _pollAllOtpSyncChecks();
+      _pollActiveOtpSyncCheck();
     });
   }
 
@@ -1550,31 +1566,58 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpAutoSyncPollTimer = null;
   }
 
-  void _pollAllOtpSyncChecks() {
-    for (final contact in _contacts) {
-      if (getContactOtpPad(contact.publicKeyHex)?.enabled == true) {
-        checkContactPadSync(contact.publicKeyHex);
-      }
+  void _pollActiveOtpSyncCheck() {
+    final contactKeyHex = _activeContactKey;
+    if (contactKeyHex != null &&
+        getContactOtpPad(contactKeyHex)?.enabled == true) {
+      checkContactPadSync(contactKeyHex);
     }
-    for (final channel in _channels) {
-      if (getChannelOtpPad(channel.index)?.enabled == true) {
-        checkChannelPadSync(channel.index);
-      }
+    final channelIndex = _activeChannelIndex;
+    if (channelIndex != null &&
+        getChannelOtpPad(channelIndex)?.enabled == true) {
+      checkChannelPadSync(channelIndex);
     }
   }
 
-  /// Called right after a send or receive completes for [contactKeyHex] so
-  /// drift gets caught quickly instead of waiting for the next periodic
-  /// poll — cheap, since a sync-check is just a few bytes of plaintext
-  /// metadata.
+  // Several independent events all want to "prompt a check soon": a
+  // send/receive completing, opening the chat screen, and focusing the
+  // compose field can all land within the same second or two of each
+  // other (e.g. open a chat and immediately tap to type). Without a
+  // cooldown that's an extra mesh transmission per event that fires in
+  // that window, for no extra information. _lastPromptSyncCheckAt makes
+  // a burst of triggers collapse into the one check that actually gets
+  // sent, without adding a manual "did I already check recently"
+  // condition at every call site.
+  final Map<String, DateTime> _lastPromptSyncCheckAt = {};
+  static const Duration _promptSyncCheckCooldown = Duration(seconds: 5);
+
+  bool _shouldSendPromptSyncCheck(String cooldownKey) {
+    final last = _lastPromptSyncCheckAt[cooldownKey];
+    final now = DateTime.now();
+    if (last != null && now.difference(last) < _promptSyncCheckCooldown) {
+      return false;
+    }
+    _lastPromptSyncCheckAt[cooldownKey] = now;
+    return true;
+  }
+
+  /// Called right after a send, a receive, opening the chat, or focusing
+  /// the compose field for [contactKeyHex], so drift gets caught quickly
+  /// rather than waiting for the next periodic poll — cheap, since a
+  /// sync-check is just a few bytes of plaintext metadata, and
+  /// event-driven rather than timer-driven so it doesn't add to the
+  /// periodic airtime budget above (see _shouldSendPromptSyncCheck for
+  /// why a burst of these still only sends one).
   void _requestPromptContactSyncCheck(String contactKeyHex) {
-    if (getContactOtpPad(contactKeyHex)?.enabled == true) {
+    if (getContactOtpPad(contactKeyHex)?.enabled == true &&
+        _shouldSendPromptSyncCheck('c:$contactKeyHex')) {
       checkContactPadSync(contactKeyHex);
     }
   }
 
   void _requestPromptChannelSyncCheck(int channelIndex) {
-    if (getChannelOtpPad(channelIndex)?.enabled == true) {
+    if (getChannelOtpPad(channelIndex)?.enabled == true &&
+        _shouldSendPromptSyncCheck('s:$channelIndex')) {
       checkChannelPadSync(channelIndex);
     }
   }
@@ -2338,6 +2381,10 @@ class MeshCoreConnector extends ChangeNotifier {
     _activeContactKey = contactKeyHex;
     if (contactKeyHex != null) {
       markContactRead(contactKeyHex);
+      // Opening a chat is exactly the moment the periodic poll above
+      // would otherwise have to wait up to _otpAutoSyncPollInterval to
+      // first check it — check right away instead.
+      _requestPromptContactSyncCheck(contactKeyHex);
     }
   }
 
@@ -2345,7 +2392,20 @@ class MeshCoreConnector extends ChangeNotifier {
     _activeChannelIndex = channelIndex;
     if (channelIndex != null) {
       markChannelRead(channelIndex);
+      _requestPromptChannelSyncCheck(channelIndex);
     }
+  }
+
+  /// Called when the message-compose field gains focus (i.e. the person is
+  /// about to start typing a reply) so a drifted pad is caught BEFORE real
+  /// pad bytes get burned sending into it, rather than only ever surfacing
+  /// after the fact as a failed decrypt on the other end.
+  void notifyComposeStartedForContact(String contactKeyHex) {
+    _requestPromptContactSyncCheck(contactKeyHex);
+  }
+
+  void notifyComposeStartedForChannel(int channelIndex) {
+    _requestPromptChannelSyncCheck(channelIndex);
   }
 
   void markContactRead(String contactKeyHex) {
