@@ -447,6 +447,36 @@ class MeshCoreConnector extends ChangeNotifier {
   final Map<int, Map<String, OtpSyncStatus>> _channelOtpSyncStatus = {};
   final Map<String, Timer> _otpSyncTimeoutTimers = {};
   static const Duration _otpSyncTimeout = Duration(seconds: 20);
+  // ── OTP pad auto-resync ────────────────────────────────────────────────
+  // Every send burns pad bytes off the sender's own local copy immediately,
+  // before any confirmation the message was actually received - so a lost
+  // packet (dropped over the mesh, a chunk that times out, a device
+  // restarting mid-exchange) leaves the sender's counter ahead of the
+  // receiver's, and every message after that decrypts against the wrong
+  // slice of pad. Recovery is one-directional and safe by construction:
+  // this device's own "how much of the peer's stream have I consumed"
+  // counter (theirOffset for a DM, offset for a channel) can always be
+  // advanced FORWARD to match what the peer reports having sent, without
+  // ever reusing a pad byte - it only ever skips ahead past bytes the
+  // sender already burned. The specific message(s) that got lost are gone
+  // either way (that content was unrecoverable the moment the sender
+  // burned its own copy); resyncing just stops it from corrupting every
+  // message afterward too. This NEVER touches myOffset/this device's own
+  // send counter - that's this device's own record of what it has
+  // actually transmitted, not something to guess at from a peer's report.
+  //
+  // To avoid discarding a message that's merely still in flight (not
+  // actually lost), a detected gap has to persist across the same value
+  // for _resyncGracePeriod before it's acted on.
+  static const Duration _resyncGracePeriod = Duration(seconds: 12);
+  final Map<String, ({int gap, DateTime firstSeen})> _pendingContactResync =
+      {};
+  // channelIndex -> senderName -> pending gap for that participant.
+  final Map<int, Map<String, ({int gap, DateTime firstSeen})>>
+  _pendingChannelResync = {};
+  final Map<String, Timer> _otpResyncTimers = {};
+  Timer? _otpAutoSyncPollTimer;
+  static const Duration _otpAutoSyncPollInterval = Duration(seconds: 30);
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
@@ -955,6 +985,7 @@ class MeshCoreConnector extends ChangeNotifier {
     );
     _contactOtpPads[contactKeyHex] = pad;
     await _otpPadStore.saveContactPad(contactKeyHex, pad);
+    _clearContactSyncState(contactKeyHex);
     notifyListeners();
   }
 
@@ -977,6 +1008,7 @@ class MeshCoreConnector extends ChangeNotifier {
     );
     _channelOtpPads[channelIndex] = pad;
     await _otpPadStore.saveChannelPad(channelIndex, pad);
+    _clearChannelSyncState(channelIndex);
     notifyListeners();
   }
 
@@ -1001,13 +1033,36 @@ class MeshCoreConnector extends ChangeNotifier {
   Future<void> clearContactOtpPad(String contactKeyHex) async {
     _contactOtpPads[contactKeyHex] = null;
     await _otpPadStore.clearContactPad(contactKeyHex);
+    _clearContactSyncState(contactKeyHex);
     notifyListeners();
   }
 
   Future<void> clearChannelOtpPad(int channelIndex) async {
     _channelOtpPads[channelIndex] = null;
     await _otpPadStore.clearChannelPad(channelIndex);
+    _clearChannelSyncState(channelIndex);
     notifyListeners();
+  }
+
+  /// A wiped or freshly-imported pad shouldn't carry over a stale
+  /// resync countdown or status line from whatever the pad used to be.
+  void _clearContactSyncState(String contactKeyHex) {
+    _contactOtpSyncStatus.remove(contactKeyHex);
+    _pendingContactResync.remove(contactKeyHex);
+    _otpResyncTimers.remove('rc:$contactKeyHex')?.cancel();
+    _otpSyncTimeoutTimers.remove('c:$contactKeyHex')?.cancel();
+  }
+
+  void _clearChannelSyncState(int channelIndex) {
+    final perChannel = _channelOtpSyncStatus.remove(channelIndex);
+    final pendingPerChannel = _pendingChannelResync.remove(channelIndex);
+    if (pendingPerChannel != null) {
+      for (final senderName in pendingPerChannel.keys) {
+        _otpResyncTimers.remove('rs:$channelIndex:$senderName')?.cancel();
+      }
+    }
+    perChannel?.clear();
+    _otpSyncTimeoutTimers.remove('s:$channelIndex')?.cancel();
   }
 
   // ── OTP passphrase lock + panic wipe ─────────────────────────────────
@@ -1284,6 +1339,13 @@ class MeshCoreConnector extends ChangeNotifier {
             ? null
             : (primaryDrift > 0 ? 'mine-ahead' : 'theirs-ahead'),
       );
+      // Only ever track/auto-fix the direction this device can safely fix
+      // itself: "I'm behind on receiving what they say they've sent"
+      // (peerMyOffset > pad.theirOffset). The other mismatch direction
+      // (otherDrift) is THEIR receive lag, not fixable from here — it
+      // resolves itself on their device via the identical logic once our
+      // reply below reaches them.
+      _trackContactResyncGap(contact.publicKeyHex, peerMyOffset - pad.theirOffset);
     }
     if (!payload.isReply && pad != null) {
       final reply = pad.isSharedSequential
@@ -1334,6 +1396,9 @@ class MeshCoreConnector extends ChangeNotifier {
             ? null
             : (drift > 0 ? 'mine-ahead' : 'theirs-ahead'),
       );
+      // Same reasoning as the contact side: only auto-fix "I'm behind
+      // this participant's reported offset" (peerOffset > pad.offset).
+      _trackChannelResyncGap(channelIndex, senderName, peerOffset - pad.offset);
     }
     if (!payload.isReply && pad != null) {
       final reply = OtpSyncService.buildShared(
@@ -1351,6 +1416,167 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     notifyListeners();
     return true;
+  }
+
+  // ── OTP pad auto-resync ────────────────────────────────────────────────
+  // See the field doc on `_resyncGracePeriod` above for the full reasoning.
+
+  void _trackContactResyncGap(String contactKeyHex, int gap) {
+    final timerKey = 'rc:$contactKeyHex';
+    if (gap <= 0) {
+      _pendingContactResync.remove(contactKeyHex);
+      _otpResyncTimers.remove(timerKey)?.cancel();
+      return;
+    }
+    final existing = _pendingContactResync[contactKeyHex];
+    if (existing != null && existing.gap == gap) return; // same drift, timer already running
+    _pendingContactResync[contactKeyHex] = (gap: gap, firstSeen: DateTime.now());
+    _otpResyncTimers[timerKey]?.cancel();
+    _otpResyncTimers[timerKey] = Timer(
+      _resyncGracePeriod,
+      () => _maybeAutoResyncContact(contactKeyHex),
+    );
+  }
+
+  void _maybeAutoResyncContact(String contactKeyHex) {
+    final pending = _pendingContactResync.remove(contactKeyHex);
+    if (pending == null) return;
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) return;
+    final gap = pending.gap;
+    if (pad.theirBytesRemaining < gap) {
+      _contactOtpSyncStatus[contactKeyHex] =
+          (_contactOtpSyncStatus[contactKeyHex] ??
+                  OtpSyncStatus(checkedAt: DateTime.now()))
+              .copyWith(
+                inSync: false,
+                driftBytes: gap,
+                driftDirection: 'theirs-ahead',
+              );
+      notifyListeners();
+      return;
+    }
+    final updated = pad.copyWith(theirOffset: pad.theirOffset + gap);
+    _contactOtpPads[contactKeyHex] = updated;
+    unawaited(_otpPadStore.saveContactPad(contactKeyHex, updated));
+    _contactOtpSyncStatus[contactKeyHex] = OtpSyncStatus(
+      checkedAt: DateTime.now(),
+      repliedAt: DateTime.now(),
+      inSync: true,
+      autoResyncedBytes: gap,
+    );
+    notifyListeners();
+    checkContactPadSync(contactKeyHex); // confirm we're actually caught up now
+  }
+
+  void _trackChannelResyncGap(int channelIndex, String senderName, int gap) {
+    final timerKey = 'rs:$channelIndex:$senderName';
+    final perChannel = _pendingChannelResync.putIfAbsent(
+      channelIndex,
+      () => {},
+    );
+    if (gap <= 0) {
+      perChannel.remove(senderName);
+      _otpResyncTimers.remove(timerKey)?.cancel();
+      return;
+    }
+    final existing = perChannel[senderName];
+    if (existing != null && existing.gap == gap) return;
+    perChannel[senderName] = (gap: gap, firstSeen: DateTime.now());
+    _otpResyncTimers[timerKey]?.cancel();
+    _otpResyncTimers[timerKey] = Timer(
+      _resyncGracePeriod,
+      () => _maybeAutoResyncChannel(channelIndex, senderName),
+    );
+  }
+
+  void _maybeAutoResyncChannel(int channelIndex, String senderName) {
+    final perChannel = _pendingChannelResync[channelIndex];
+    final pending = perChannel?.remove(senderName);
+    if (pending == null) return;
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) return;
+    final gap = pending.gap;
+    final statuses = _channelOtpSyncStatus.putIfAbsent(channelIndex, () => {});
+    if (pad.myBytesRemaining < gap) {
+      statuses[senderName] =
+          (statuses[senderName] ?? OtpSyncStatus(checkedAt: DateTime.now()))
+              .copyWith(
+                inSync: false,
+                driftBytes: gap,
+                driftDirection: 'theirs-ahead',
+              );
+      notifyListeners();
+      return;
+    }
+    // advanceShared moves the ONE shared offset this pad's sending and
+    // receiving both use (see OtpPad.advanceShared doc) - the same
+    // operation a real receive would perform, just without decrypting
+    // anything, since what would have been decrypted is unrecoverable.
+    final updated = pad.advanceShared(gap);
+    _channelOtpPads[channelIndex] = updated;
+    unawaited(_otpPadStore.saveChannelPad(channelIndex, updated));
+    statuses[senderName] = OtpSyncStatus(
+      checkedAt: DateTime.now(),
+      repliedAt: DateTime.now(),
+      inSync: true,
+      autoResyncedBytes: gap,
+    );
+    notifyListeners();
+    checkChannelPadSync(channelIndex);
+  }
+
+  // ── OTP pad periodic + post-activity sync-checking ─────────────────────
+  // Runs alongside battery polling (see the calls next to
+  // _startBatteryPolling/_stopBatteryPolling) so it shares the same
+  // connected-device lifecycle without a separate connect/disconnect path
+  // to keep in sync. Checks every contact/channel with OTP enabled, not
+  // just whichever one the person currently has open — this app can be
+  // backgrounded, so "only check what's on screen" would miss drift on
+  // every other conversation.
+  void _startOtpAutoSyncPolling() {
+    _otpAutoSyncPollTimer?.cancel();
+    _otpAutoSyncPollTimer = Timer.periodic(_otpAutoSyncPollInterval, (timer) {
+      if (!isConnected) {
+        timer.cancel();
+        return;
+      }
+      _pollAllOtpSyncChecks();
+    });
+  }
+
+  void _stopOtpAutoSyncPolling() {
+    _otpAutoSyncPollTimer?.cancel();
+    _otpAutoSyncPollTimer = null;
+  }
+
+  void _pollAllOtpSyncChecks() {
+    for (final contact in _contacts) {
+      if (getContactOtpPad(contact.publicKeyHex)?.enabled == true) {
+        checkContactPadSync(contact.publicKeyHex);
+      }
+    }
+    for (final channel in _channels) {
+      if (getChannelOtpPad(channel.index)?.enabled == true) {
+        checkChannelPadSync(channel.index);
+      }
+    }
+  }
+
+  /// Called right after a send or receive completes for [contactKeyHex] so
+  /// drift gets caught quickly instead of waiting for the next periodic
+  /// poll — cheap, since a sync-check is just a few bytes of plaintext
+  /// metadata.
+  void _requestPromptContactSyncCheck(String contactKeyHex) {
+    if (getContactOtpPad(contactKeyHex)?.enabled == true) {
+      checkContactPadSync(contactKeyHex);
+    }
+  }
+
+  void _requestPromptChannelSyncCheck(int channelIndex) {
+    if (getChannelOtpPad(channelIndex)?.enabled == true) {
+      checkChannelPadSync(channelIndex);
+    }
   }
 
   // ── OTP pad consumption ──────────────────────────────────────────────
@@ -1408,6 +1634,7 @@ class MeshCoreConnector extends ChangeNotifier {
     final ciphertext = OtpService.encrypt(plaintext, consumption.keyBytes);
     _contactOtpPads[contactKeyHex] = consumption.updated;
     await _otpPadStore.saveContactPad(contactKeyHex, consumption.updated);
+    _requestPromptContactSyncCheck(contactKeyHex);
     return ciphertext;
   }
 
@@ -1421,6 +1648,7 @@ class MeshCoreConnector extends ChangeNotifier {
     final ciphertext = OtpService.encrypt(plaintext, consumption.keyBytes);
     _channelOtpPads[channelIndex] = consumption.updated;
     await _otpPadStore.saveChannelPad(channelIndex, consumption.updated);
+    _requestPromptChannelSyncCheck(channelIndex);
     return ciphertext;
   }
 
@@ -1507,8 +1735,10 @@ class MeshCoreConnector extends ChangeNotifier {
       plainBytes = OtpService.decryptBytesFromHex(hex, consumption.keyBytes);
       _contactOtpPads[contactKeyHex] = consumption.updated;
       unawaited(_otpPadStore.saveContactPad(contactKeyHex, consumption.updated));
+      _requestPromptContactSyncCheck(contactKeyHex);
     } catch (e) {
       appLogger.warn('OTP decrypt failed for contact $contactKeyHex: $e');
+      _requestPromptContactSyncCheck(contactKeyHex);
       return (
         handled: true,
         displayText: '🔒 Could not decrypt — pad may be out of sync',
@@ -1568,8 +1798,10 @@ class MeshCoreConnector extends ChangeNotifier {
       plainBytes = OtpService.decryptBytesFromHex(hex, consumption.keyBytes);
       _channelOtpPads[channelIndex] = consumption.updated;
       unawaited(_otpPadStore.saveChannelPad(channelIndex, consumption.updated));
+      _requestPromptChannelSyncCheck(channelIndex);
     } catch (e) {
       appLogger.warn('OTP decrypt failed for channel $channelIndex: $e');
+      _requestPromptChannelSyncCheck(channelIndex);
       return (
         handled: true,
         displayText: '🔒 Could not decrypt — pad may be out of sync',
@@ -1914,6 +2146,9 @@ class MeshCoreConnector extends ChangeNotifier {
         status: success ? MessageStatus.delivered : MessageStatus.failed,
       ),
     );
+    if (success) {
+      _requestPromptContactSyncCheck(state.contact.publicKeyHex);
+    }
   }
 
   // ── OTP chunk send (channel) ─────────────────────────────────────────
@@ -2075,6 +2310,9 @@ class MeshCoreConnector extends ChangeNotifier {
         status: success ? ChannelMessageStatus.sent : ChannelMessageStatus.failed,
       ),
     );
+    if (success) {
+      _requestPromptChannelSyncCheck(state.channel.index);
+    }
   }
 
   Future<void> loadUnreadState() async {
@@ -3071,6 +3309,7 @@ class MeshCoreConnector extends ChangeNotifier {
       );
       await _requestDeviceInfo();
       _startBatteryPolling();
+      _startOtpAutoSyncPolling();
       if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
       var gotSelfInfo = await _waitForSelfInfo(
         timeout: const Duration(seconds: 3),
@@ -3179,6 +3418,7 @@ class MeshCoreConnector extends ChangeNotifier {
       _pendingInitialContactsSync = true;
       await _requestDeviceInfo();
       _startBatteryPolling();
+      _startOtpAutoSyncPolling();
       if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
 
       var gotSelfInfo = await _waitForSelfInfo(
@@ -3881,6 +4121,7 @@ class MeshCoreConnector extends ChangeNotifier {
 
     await _requestDeviceInfo();
     _startBatteryPolling();
+    _startOtpAutoSyncPolling();
     if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
 
     final gotSelfInfo = await _waitForSelfInfo(
@@ -4021,6 +4262,7 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     _setState(MeshCoreConnectionState.disconnecting);
     _stopBatteryPolling();
+    _stopOtpAutoSyncPolling();
     _stopRadioStatsPolling();
 
     await _usbFrameSubscription?.cancel();
@@ -8244,6 +8486,7 @@ class MeshCoreConnector extends ChangeNotifier {
 
   void _handleDisconnection() {
     _stopBatteryPolling();
+    _stopOtpAutoSyncPolling();
     _stopGpsLocationPolling();
     _stopRadioStatsPolling();
     _latestRadioStats = null;
@@ -8417,9 +8660,13 @@ class MeshCoreConnector extends ChangeNotifier {
     _notifyListenersTimer?.cancel();
     _reconnectTimer?.cancel();
     _batteryPollTimer?.cancel();
+    _otpAutoSyncPollTimer?.cancel();
     _gpsLocationPollTimer?.cancel();
     _radioStatsPollTimer?.cancel();
     for (final timer in _otpSyncTimeoutTimers.values) {
+      timer.cancel();
+    }
+    for (final timer in _otpResyncTimers.values) {
       timer.cancel();
     }
     radioStatsNotifier.dispose();

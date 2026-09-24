@@ -31,6 +31,13 @@ class OtpSyncStatus {
   /// `'mine-ahead'`, `'theirs-ahead'`, or null (in sync / unknown).
   final String? driftDirection;
 
+  /// Non-null only on the status update produced by an automatic resync
+  /// (see `MeshCoreConnector._maybeAutoResyncContact`/`_maybeAutoResyncChannel`):
+  /// how many bytes this device just skipped forward to catch up. A
+  /// message worth of pad may have been unrecoverably lost in transit —
+  /// this is surfaced in the UI rather than silently absorbed.
+  final int? autoResyncedBytes;
+
   const OtpSyncStatus({
     required this.checkedAt,
     this.repliedAt,
@@ -38,6 +45,7 @@ class OtpSyncStatus {
     this.inSync,
     this.driftBytes,
     this.driftDirection,
+    this.autoResyncedBytes,
   });
 
   /// Still waiting on a reply to a check this device sent.
@@ -50,6 +58,7 @@ class OtpSyncStatus {
     Object? inSync = _unset,
     Object? driftBytes = _unset,
     Object? driftDirection = _unset,
+    Object? autoResyncedBytes = _unset,
   }) {
     return OtpSyncStatus(
       checkedAt: checkedAt ?? this.checkedAt,
@@ -64,6 +73,9 @@ class OtpSyncStatus {
       driftDirection: driftDirection == _unset
           ? this.driftDirection
           : driftDirection as String?,
+      autoResyncedBytes: autoResyncedBytes == _unset
+          ? this.autoResyncedBytes
+          : autoResyncedBytes as int?,
     );
   }
 

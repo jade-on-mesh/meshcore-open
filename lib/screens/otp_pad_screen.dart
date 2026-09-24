@@ -108,8 +108,6 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               if (pad != null) ...[
                 const SectionHeader('Pad usage'),
                 _buildUsageCard(context, connector, pad),
-                const SectionHeader('Fingerprint'),
-                _buildFingerprintCard(context, pad),
                 const SectionHeader('Sync check'),
                 _buildSyncCard(context, connector, pad),
                 const SectionHeader('Manage'),
@@ -418,70 +416,17 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     );
   }
 
-  // ── Fingerprint card ─────────────────────────────────────────────────
-  // A short, human-comparable hash of the FULL pad — shown right after
-  // import AND re-viewable any time from here, so a device that imported
-  // via QR (or whose partner scanned it a moment later) can always come
-  // back and read this aloud to compare. See OtpPad.fingerprint.
-
-  Widget _buildFingerprintCard(BuildContext context, OtpPad pad) {
-    final scheme = Theme.of(context).colorScheme;
-    return MeshCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.fingerprint, color: MeshPalette.blue),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'Pad fingerprint',
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              IconButton(
-                tooltip: 'Copy',
-                icon: const Icon(Icons.copy, size: 18),
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: pad.fingerprint));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Fingerprint copied')),
-                  );
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          SelectableText(
-            pad.fingerprint,
-            style: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 1.5,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Compare this with what shows on the other person\'s screen — '
-            'if they don\'t match exactly, don\'t use this pad, something '
-            'intercepted your QR code.',
-            style: Theme.of(
-              context,
-            ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
-          ),
-        ],
-      ),
-    );
-  }
-
   // ── Sync-check card ──────────────────────────────────────────────────
   // New feature (no Lua equivalent): confirms both sides' pad offsets
   // haven't drifted apart, without spending any pad bytes — see
-  // otp_sync_service.dart / MeshCoreConnector.checkContactPadSync.
+  // otp_sync_service.dart / MeshCoreConnector.checkContactPadSync. This
+  // button is a manual trigger on top of checks the connector already
+  // runs on its own: every ~30s while connected, and right after any
+  // send/receive/decrypt-failure. If a drift persists for more than a
+  // few seconds (not just a message still in flight), the app corrects
+  // its own receive-side counter automatically — see the "Auto-resynced"
+  // status in _syncStatusRow and MeshCoreConnector's OTP pad auto-resync
+  // section for the full safety reasoning.
 
   Widget _buildSyncCard(
     BuildContext context,
@@ -562,7 +507,13 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     final Color color;
     final IconData icon;
     final String text;
-    if (status.inSync == true) {
+    if (status.autoResyncedBytes != null) {
+      color = MeshPalette.warn;
+      icon = Icons.sync_problem;
+      text =
+          'Auto-resynced — skipped ${status.autoResyncedBytes} bytes to '
+          'catch up (a message may have been lost)';
+    } else if (status.inSync == true) {
       color = MeshPalette.blue;
       icon = Icons.check_circle_outline;
       text = 'In sync';
@@ -955,50 +906,6 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     setState(() => _busy = false);
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('OTP pad imported and enabled')),
-    );
-    // Show the fingerprint immediately, prominently, right after import —
-    // the whole point is to catch a swapped/tampered QR code before either
-    // side sends anything, and the other person may be ready to compare
-    // right now.
-    final pad = _currentPad(connector);
-    if (pad != null) _showFingerprintDialog(pad);
-  }
-
-  void _showFingerprintDialog(OtpPad pad) {
-    showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        icon: const Icon(Icons.fingerprint, color: MeshPalette.blue, size: 32),
-        title: const Text('Compare this fingerprint'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SelectableText(
-              pad.fingerprint,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 22,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1.5,
-              ),
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              "Read this to the other person (or compare with what's on "
-              "their screen). If it doesn't match EXACTLY, don't use this "
-              'pad — something intercepted or substituted your QR code.',
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Got it'),
-          ),
-        ],
-      ),
     );
   }
 
