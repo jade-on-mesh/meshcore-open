@@ -24,11 +24,6 @@ import '../storage/otp_pad_store.dart';
 import '../services/app_debug_log_service.dart';
 import '../services/otp_service.dart';
 import '../services/otp_chunk_service.dart';
-
-/// Result of trying to OTP-decrypt+dispatch one incoming message — see the
-/// "OTP receive dispatch" section of [MeshCoreConnector] for what each
-/// combination means.
-typedef _OtpDispatchResult = ({bool handled, String? displayText});
 import '../services/ble_debug_log_service.dart';
 import '../services/linux_ble_error_classifier.dart';
 import '../services/linux_ble_pairing_service_stub.dart'
@@ -67,6 +62,11 @@ import '../utils/battery_utils.dart';
 import '../utils/platform_info.dart';
 import 'meshcore_uuids.dart';
 import 'meshcore_protocol.dart';
+
+/// Result of trying to OTP-decrypt+dispatch one incoming message — see the
+/// "OTP receive dispatch" section of [MeshCoreConnector] for what each
+/// combination means.
+typedef _OtpDispatchResult = ({bool handled, String? displayText});
 
 class DirectRepeater {
   static const int maxAgeMinutes = 30; // Max age for direct repeater info
