@@ -200,8 +200,12 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
           Row(
             children: [
               StatusChip(
-                label: 'Role ${pad.role.label}',
-                icon: Icons.badge_outlined,
+                label: pad.isSharedSequential
+                    ? 'Shared (group)'
+                    : 'Role ${pad.role.label}',
+                icon: pad.isSharedSequential
+                    ? Icons.groups_outlined
+                    : Icons.badge_outlined,
                 color: MeshPalette.blue,
               ),
               const Spacer(),
@@ -221,23 +225,37 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
             ),
           ],
           const SizedBox(height: 18),
-          _usageRow(
-            context,
-            label: 'Your messages',
-            usedFraction: pad.myUsageFraction,
-            remainingBytes: pad.myBytesRemaining,
-            color: MeshPalette.blue,
-            approxMessages: (pad.myBytesRemaining / maxPerMsg).floor(),
-          ),
-          const SizedBox(height: 14),
-          _usageRow(
-            context,
-            label: 'Their messages',
-            usedFraction: pad.theirUsageFraction,
-            remainingBytes: pad.theirBytesRemaining,
-            color: MeshPalette.magenta,
-            approxMessages: (pad.theirBytesRemaining / maxPerMsg).floor(),
-          ),
+          if (pad.isSharedSequential)
+            // One shared front-of-pad counter for everyone in the group —
+            // sending and receiving consume it identically, so there's
+            // only one meter to show (see OtpPad.offset).
+            _usageRow(
+              context,
+              label: 'Group usage',
+              usedFraction: pad.myUsageFraction,
+              remainingBytes: pad.myBytesRemaining,
+              color: MeshPalette.blue,
+              approxMessages: (pad.myBytesRemaining / maxPerMsg).floor(),
+            )
+          else ...[
+            _usageRow(
+              context,
+              label: 'Your messages',
+              usedFraction: pad.myUsageFraction,
+              remainingBytes: pad.myBytesRemaining,
+              color: MeshPalette.blue,
+              approxMessages: (pad.myBytesRemaining / maxPerMsg).floor(),
+            ),
+            const SizedBox(height: 14),
+            _usageRow(
+              context,
+              label: 'Their messages',
+              usedFraction: pad.theirUsageFraction,
+              remainingBytes: pad.theirBytesRemaining,
+              color: MeshPalette.magenta,
+              approxMessages: (pad.theirBytesRemaining / maxPerMsg).floor(),
+            ),
+          ],
           if (pad.myUsageFraction > 0.85 || pad.theirUsageFraction > 0.85) ...[
             const SizedBox(height: 16),
             Container(
@@ -376,46 +394,71 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     final scheme = Theme.of(context).colorScheme;
     return Column(
       children: [
-        MeshCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Who are you in this pad?',
-                style: Theme.of(
-                  context,
-                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Agree with the other person beforehand — one of you is A, '
-                'the other is B. Getting it backwards just means messages '
-                "won't decrypt; nothing is silently reused.",
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
+        if (_isChannel)
+          MeshCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Shared group pad',
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 14),
-              SegmentedButton<OtpPadRole>(
-                segments: const [
-                  ButtonSegment(
-                    value: OtpPadRole.a,
-                    label: Text('I am Party A'),
-                    icon: Icon(Icons.looks_one_outlined),
+                const SizedBox(height: 4),
+                Text(
+                  'Channels use one shared pad for everyone — there is no '
+                  'A/B role to pick. Every member must import the exact '
+                  'same pad bytes and process messages in the same order, '
+                  'or the group will drift out of sync.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
                   ),
-                  ButtonSegment(
-                    value: OtpPadRole.b,
-                    label: Text('I am Party B'),
-                    icon: Icon(Icons.looks_two_outlined),
+                ),
+              ],
+            ),
+          )
+        else
+          MeshCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Who are you in this pad?',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Agree with the other person beforehand — one of you is A, '
+                  'the other is B. Getting it backwards just means messages '
+                  "won't decrypt; nothing is silently reused.",
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
                   ),
-                ],
-                selected: {_selectedRole},
-                onSelectionChanged: (selection) =>
-                    setState(() => _selectedRole = selection.first),
-              ),
-            ],
+                ),
+                const SizedBox(height: 14),
+                SegmentedButton<OtpPadRole>(
+                  segments: const [
+                    ButtonSegment(
+                      value: OtpPadRole.a,
+                      label: Text('I am Party A'),
+                      icon: Icon(Icons.looks_one_outlined),
+                    ),
+                    ButtonSegment(
+                      value: OtpPadRole.b,
+                      label: Text('I am Party B'),
+                      icon: Icon(Icons.looks_two_outlined),
+                    ),
+                  ],
+                  selected: {_selectedRole},
+                  onSelectionChanged: (selection) =>
+                      setState(() => _selectedRole = selection.first),
+                ),
+              ],
+            ),
           ),
-        ),
         MeshCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -652,11 +695,15 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       context: context,
       data: pad.padHex,
       title: 'Scan on the other device',
-      instructions:
-          'This shows the raw pad in plain sight — make sure no one else '
-          'can see your screen while the other device scans it. The other '
-          'person must pick the opposite role (${pad.role == OtpPadRole.a ? 'B' : 'A'}) '
-          'when they import it.',
+      instructions: pad.isSharedSequential
+          ? 'This shows the raw pad in plain sight — make sure no one else '
+                'can see your screen while others scan it. Every member of '
+                'this group must import this exact same pad — there is no '
+                'role to pick for a shared group pad.'
+          : 'This shows the raw pad in plain sight — make sure no one else '
+                'can see your screen while the other device scans it. The other '
+                'person must pick the opposite role (${pad.role == OtpPadRole.a ? 'B' : 'A'}) '
+                'when they import it.',
     );
   }
 

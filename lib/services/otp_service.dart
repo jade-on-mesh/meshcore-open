@@ -28,8 +28,8 @@ class OtpPadExhaustedException implements Exception {
       '$availableBytes left in this pad';
 }
 
-/// Thrown when a received OTP payload can't be decrypted — the marker was
-/// present but the pad's remaining bytes ran out, or the hex was malformed.
+/// Thrown when a received OTP payload can't be decrypted — the hex was
+/// malformed, or the pad's remaining bytes ran out.
 class OtpDecryptException implements Exception {
   final String message;
   OtpDecryptException(this.message);
@@ -41,30 +41,32 @@ class OtpDecryptException implements Exception {
 /// Pure one-time-pad encrypt/decrypt for MeshCore Open text messages.
 ///
 /// This is a direct port of the XOR core proved out on real hardware in the
-/// WADAMESH Lua OTP messenger, adapted to this app's transport constraints:
+/// WADAMESH Lua OTP messenger (OTP_2_RC15.lua), adapted to this app's
+/// transport constraints:
 ///
 /// - The companion BLE text pipe is NOT byte-safe. `BufferWriter.writeString`
 ///   UTF-8-encodes its input and `BufferReader.readCString` stops dead at the
 ///   first 0x00 byte. Raw XOR ciphertext is uniformly random — it contains
 ///   0x00 bytes constantly and is not valid UTF-8 — so ciphertext is always
 ///   carried as lowercase hex, never as raw bytes, inside a `String`.
-/// - Every OTP payload is prefixed with [marker] so it can be recognized
-///   before Smaz compression or Cyr2Lat transliteration would otherwise try
-///   to touch it (both would corrupt hex ciphertext, and compressing random
-///   bytes never helps anyway).
+/// - Wire compatibility with the Lua app: outgoing OTP payloads are BARE
+///   lowercase hex with no marker/prefix of any kind — this matches exactly
+///   what `wada.mesh.send_dm`/`wada.mesh.send` puts on the air in the Lua
+///   app. There used to be a "OTP1|" marker prefix here; it has been
+///   removed because Lua never sends or expects one, and a marker Flutter
+///   invented on its own breaks interop with real Lua devices.
+///
+///   Because there's no marker, incoming-message recognition instead relies
+///   on (a) OTP being enabled for the specific contact/channel the message
+///   came from, and (b) the message actually looking like ciphertext hex —
+///   see [extractCiphertextHex], a direct port of the Lua receiver's own
+///   hex-recognition/trailing-hex-tail fallback logic.
 class OtpService {
   OtpService._();
 
-  /// Prefixes every OTP-encrypted payload actually placed on the wire.
-  /// Chosen to line up with this app's existing structured-payload markers
-  /// ("g:", "m:", "V1|") that already bypass Smaz/Cyr2Lat.
-  static const String marker = 'OTP1|';
-
-  static bool isOtpPayload(String text) => text.startsWith(marker);
-
   /// Encrypts [plaintext] against [keyBytes] (a slice already carved out of
-  /// the sender's half of the pad, exactly [utf8.encode(plaintext).length]
-  /// bytes long) and returns the full wire payload including [marker].
+  /// the sender's pad, exactly [utf8.encode(plaintext).length] bytes long)
+  /// and returns the bare lowercase-hex wire payload (no marker).
   ///
   /// Throws [OtpPadExhaustedException] if [keyBytes] is shorter than the
   /// plaintext requires — callers should check [plaintextByteLength] against
@@ -72,6 +74,18 @@ class OtpService {
   /// authoritative guard.
   static String encrypt(String plaintext, Uint8List keyBytes) {
     final plainBytes = Uint8List.fromList(utf8.encode(plaintext));
+    final cipherBytes = encryptBytes(plainBytes, keyBytes);
+    return bytesToHex(cipherBytes);
+  }
+
+  /// Byte-level XOR encrypt. Used directly by the single-shot [encrypt]
+  /// above and by the chunk-framing code in otp_chunk_service.dart, which
+  /// needs to encrypt a raw framed byte buffer (marker + header + chunk
+  /// data) rather than a UTF-8 Dart [String] — chunk data is a byte slice
+  /// that may not be valid UTF-8 on its own if a multi-byte codepoint was
+  /// split across a chunk boundary, so it must never round-trip through
+  /// `String`/`utf8.encode` again.
+  static Uint8List encryptBytes(Uint8List plainBytes, Uint8List keyBytes) {
     if (keyBytes.length < plainBytes.length) {
       throw OtpPadExhaustedException(
         neededBytes: plainBytes.length,
@@ -82,22 +96,28 @@ class OtpService {
     for (var i = 0; i < plainBytes.length; i++) {
       cipherBytes[i] = plainBytes[i] ^ keyBytes[i];
     }
-    return '$marker${_bytesToHex(cipherBytes)}';
+    return cipherBytes;
   }
 
-  /// Decrypts a full wire payload (including [marker]) against [keyBytes]
-  /// (the receiver's own tracked slice of the *other* party's half of the
-  /// pad, which must be at least as long as the ciphertext).
+  /// Decrypts a bare hex ciphertext payload against [keyBytes] and returns
+  /// the plaintext as a `String` (UTF-8 decoded, malformed sequences
+  /// replaced rather than thrown). For single-shot messages only — chunk
+  /// reassembly must stay at the byte level until all chunks are joined,
+  /// so it uses [decryptBytesFromHex] directly instead of this.
   ///
-  /// Returns null if [payload] isn't an OTP payload at all (no marker) so
-  /// callers can fall through to normal handling. Throws
-  /// [OtpDecryptException] if it IS marked as OTP but can't actually be
-  /// decrypted (malformed hex, or not enough pad left on our side — the
-  /// latter usually means the two sides' pad offsets have drifted out of
-  /// sync, e.g. from a dropped message).
-  static String? decrypt(String payload, Uint8List keyBytes) {
-    if (!isOtpPayload(payload)) return null;
-    final hex = payload.substring(marker.length);
+  /// Throws [OtpDecryptException] if the hex is malformed or there isn't
+  /// enough pad left (the latter usually means the two sides' pad offsets
+  /// have drifted out of sync, e.g. from a dropped message).
+  static String decrypt(String hex, Uint8List keyBytes) {
+    final plainBytes = decryptBytesFromHex(hex, keyBytes);
+    return utf8.decode(plainBytes, allowMalformed: true);
+  }
+
+  /// Byte-level decrypt from a hex ciphertext string. Returns the raw
+  /// plaintext bytes without any UTF-8 interpretation, so callers can check
+  /// for the binary chunk/ack markers (see otp_chunk_service.dart) before
+  /// deciding whether this is even meant to be decoded as text at all.
+  static Uint8List decryptBytesFromHex(String hex, Uint8List keyBytes) {
     Uint8List cipherBytes;
     try {
       cipherBytes = hex2Uint8List(hex);
@@ -114,31 +134,71 @@ class OtpService {
     for (var i = 0; i < cipherBytes.length; i++) {
       plainBytes[i] = cipherBytes[i] ^ keyBytes[i];
     }
-    return utf8.decode(plainBytes, allowMalformed: true);
+    return plainBytes;
   }
+
+  /// Lua-compatible ciphertext recognition (OTP_2_RC15.lua's receive-side
+  /// hex detection). [text] here is whatever this app has already extracted
+  /// as "the message body" for the contact/channel in question — this app,
+  /// unlike Lua, already splits a firmware "SenderName: text" combined
+  /// string into separate sender/text fields upstream of OTP handling (see
+  /// ChannelMessage.fromFrame / _splitSenderText in meshcore_connector.dart),
+  /// so that part of Lua's logic doesn't need porting here — only the hex
+  /// recognition itself does:
+  ///
+  ///   - If [text] is itself pure lowercase-or-uppercase hex of even
+  ///     length, it's returned as-is.
+  ///   - Otherwise, Lua falls back to the longest trailing run of hex
+  ///     characters at the end of the string (covering cases like firmware
+  ///     or intermediate transforms prepending non-hex noise). If that
+  ///     trailing run is empty or odd-length, this isn't OTP at all.
+  ///
+  /// Returns null if [text] doesn't look like ciphertext by either rule —
+  /// callers should leave the message exactly as received in that case.
+  static String? extractCiphertextHex(String text) {
+    if (_isPureHex(text)) return text;
+    final match = RegExp(r'[0-9a-fA-F]+$').firstMatch(text);
+    final tail = match?.group(0);
+    if (tail == null || tail.isEmpty || tail.length % 2 != 0) return null;
+    return tail;
+  }
+
+  /// True if [text] is non-empty, entirely hex digits, and an even length —
+  /// i.e. could be interpreted as N encoded bytes. Used both for incoming
+  /// ciphertext recognition ([extractCiphertextHex]) and, in the connector,
+  /// to decide whether an outgoing payload IS already-computed ciphertext
+  /// (so Smaz/Cyr2Lat must not touch it) versus real plaintext that simply
+  /// happens to look hex-ish.
+  static bool looksLikeCiphertextHex(String text) => _isPureHex(text);
+
+  static bool _isPureHex(String text) =>
+      text.isNotEmpty &&
+      text.length % 2 == 0 &&
+      RegExp(r'^[0-9a-fA-F]+$').hasMatch(text);
 
   /// How many plaintext UTF-8 bytes a message to [text] would need, i.e.
   /// how many pad bytes encrypting it will consume.
   static int plaintextByteLength(String text) => utf8.encode(text).length;
 
-  /// Max plaintext bytes that fit in one OTP-encrypted contact message,
-  /// after reserving space for [marker] and doubling for hex encoding.
+  /// Max plaintext bytes that fit in one single-packet OTP-encrypted
+  /// contact message, after doubling for hex encoding. Longer messages are
+  /// sent as multiple chunks — see otp_chunk_service.dart.
   static int maxPlaintextBytesForContact() {
-    final budget = maxContactMessageBytes() - marker.length;
+    final budget = maxContactMessageBytes();
     if (budget <= 0) return 0;
     return budget ~/ 2;
   }
 
-  /// Max plaintext bytes that fit in one OTP-encrypted channel message,
-  /// after reserving space for [marker], the "<name>: " prefix the firmware
-  /// adds, and doubling for hex encoding.
+  /// Max plaintext bytes that fit in one single-packet OTP-encrypted
+  /// channel message, after reserving space for the "<name>: " prefix the
+  /// firmware adds and doubling for hex encoding.
   static int maxPlaintextBytesForChannel(String? senderName) {
-    final budget = maxChannelMessageBytes(senderName) - marker.length;
+    final budget = maxChannelMessageBytes(senderName);
     if (budget <= 0) return 0;
     return budget ~/ 2;
   }
 
-  static String _bytesToHex(Uint8List bytes) {
+  static String bytesToHex(Uint8List bytes) {
     final buffer = StringBuffer();
     for (final b in bytes) {
       buffer.write(b.toRadixString(16).padLeft(2, '0'));

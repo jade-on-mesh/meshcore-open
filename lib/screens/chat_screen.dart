@@ -27,6 +27,7 @@ import '../models/message.dart';
 import '../models/translation_support.dart';
 import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
+import '../services/otp_chunk_service.dart';
 import '../services/otp_service.dart';
 import '../services/path_history_service.dart';
 import '../services/translation_service.dart';
@@ -492,7 +493,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final maxBytes = connector.isContactOtpEnabled(
       _resolveContact(connector).publicKeyHex,
     )
-        ? OtpService.maxPlaintextBytesForContact()
+        // Longer OTP messages now get automatically split into multiple
+        // packets (see otp_chunk_service.dart), so the compose-box limit is
+        // the much larger multi-chunk cap, not the single-packet one.
+        ? OtpChunkService.maxChunkedPlaintextBytesForContact()
         : maxContactMessageBytes();
     final scheme = Theme.of(context).colorScheme;
     final settings = context.watch<AppSettingsService>().settings;
@@ -742,12 +746,14 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     if (otpEnabled) {
-      // OTP budget check: the real limit is the encrypted, hex-doubled
-      // payload against the 160-byte packet ceiling, which is what
-      // OtpService.maxPlaintextBytesForContact() already accounts for —
-      // checking prepareContactOutboundText() here would be checking the
-      // wrong thing (that only transforms plaintext with Smaz/Cyr2Lat).
-      final maxPlainBytes = OtpService.maxPlaintextBytesForContact();
+      // OTP budget check: messages over one packet's worth of plaintext are
+      // automatically split into multiple chunked packets (see
+      // otp_chunk_service.dart), so the real ceiling here is the much
+      // larger multi-chunk cap, not the single-packet
+      // OtpService.maxPlaintextBytesForContact() figure — checking
+      // prepareContactOutboundText() here would be checking the wrong thing
+      // (that only transforms plaintext with Smaz/Cyr2Lat).
+      final maxPlainBytes = OtpChunkService.maxChunkedPlaintextBytesForContact();
       if (OtpService.plaintextByteLength(outgoingText) > maxPlainBytes) {
         showDismissibleSnackBar(
           context,
