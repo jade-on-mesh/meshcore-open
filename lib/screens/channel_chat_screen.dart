@@ -31,8 +31,10 @@ import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
 import '../services/image_chunk_transport.dart';
 import '../services/image_codec_service.dart';
+import '../services/otp_service.dart';
 import '../services/received_image_store.dart';
 import '../services/translation_service.dart';
+import 'otp_pad_screen.dart';
 import '../utils/lora_airtime.dart';
 import '../widgets/received_image_message.dart';
 import '../widgets/byte_count_input.dart';
@@ -356,6 +358,26 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
             onPressed: () => openRegionSelectDialog(widget.channel),
           ),
           const RadioStatsIconButton(),
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) {
+              final otpEnabled = connector.isChannelOtpEnabled(
+                widget.channel.index,
+              );
+              return IconButton(
+                tooltip: otpEnabled ? 'OTP Pad (encrypting)' : 'OTP Pad',
+                icon: Icon(
+                  otpEnabled ? Icons.lock : Icons.lock_open,
+                  color: otpEnabled ? MeshPalette.blue : null,
+                ),
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => OtpPadScreen.forChannel(widget.channel),
+                  ),
+                ),
+              );
+            },
+          ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (value) {
@@ -562,14 +584,18 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     final scheme = Theme.of(context).colorScheme;
     final gifId = GifHelper.parseGif(message.text);
     final poi = parseMarkerText(message.text);
+    // .displayText resolves to the sender's own typed plaintext for an
+    // outgoing OTP message (message.text is the ciphertext on the wire);
+    // unchanged for everything else.
+    final baseDisplayText = message.displayText;
     final translatedDisplayText =
         message.translatedText != null &&
             message.translatedText!.trim().isNotEmpty
         ? message.translatedText!.trim()
-        : message.text;
+        : baseDisplayText;
     final originalDisplayText = message.isOutgoing
         ? message.originalText
-        : (translatedDisplayText != message.text ? message.text : null);
+        : (translatedDisplayText != baseDisplayText ? baseDisplayText : null);
     final displayPath = message.pathBytes.isNotEmpty
         ? message.pathBytes
         : (message.pathVariants.isNotEmpty
@@ -1751,7 +1777,9 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
 
   Widget _buildInputBar() {
     final connector = context.watch<MeshCoreConnector>();
-    final maxBytes = maxChannelMessageBytes(connector.selfName);
+    final maxBytes = connector.isChannelOtpEnabled(widget.channel.index)
+        ? OtpService.maxPlaintextBytesForChannel(connector.selfName)
+        : maxChannelMessageBytes(connector.selfName);
     final settings = context.watch<AppSettingsService>().settings;
     final imageCodecDownloading = _isImageCodecDownloading(context);
     final showImageAction =
@@ -2033,27 +2061,47 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
       messageText = '@[${_replyingToMessage!.senderName}] $messageText';
     }
 
-    final maxBytes = maxChannelMessageBytes(connector.selfName);
-    final outboundText = connector.prepareChannelOutboundText(
-      widget.channel.index,
-      messageText,
-    );
-    if (utf8.encode(outboundText).length > maxBytes) {
-      showDismissibleSnackBar(
-        context,
-        content: Text(context.l10n.chat_messageTooLong(maxBytes)),
-      );
-      return;
-    }
+    final otpEnabled = connector.isChannelOtpEnabled(widget.channel.index);
 
-    // When messageText is transformed with cyr2lat, it (generally) hasn't visual differences,
-    // but we getting messages doubles in chat screen (source text and transformed).
-    // To prevent, we'll perform transform of source before pass to main sender logic.
-    // We can pass whole text, senderName will be kept intact
-    if (connector.isChannelCyr2LatEnabled(widget.channel.index)) {
-      messageText = Cyr2Lat.encode(messageText);
+    if (otpEnabled) {
+      // Same reasoning as chat_screen.dart's _sendMessage: the real limit
+      // is the encrypted, hex-doubled payload, which
+      // OtpService.maxPlaintextBytesForChannel already accounts for.
+      final maxPlainBytes = OtpService.maxPlaintextBytesForChannel(
+        connector.selfName,
+      );
+      if (OtpService.plaintextByteLength(messageText) > maxPlainBytes) {
+        showDismissibleSnackBar(
+          context,
+          content: Text(context.l10n.chat_messageTooLong(maxPlainBytes)),
+        );
+        return;
+      }
+      // Skip Cyr2Lat — it would transliterate the plaintext that's about
+      // to be encrypted, corrupting what the recipient decrypts to.
+    } else {
+      final maxBytes = maxChannelMessageBytes(connector.selfName);
+      final outboundText = connector.prepareChannelOutboundText(
+        widget.channel.index,
+        messageText,
+      );
+      if (utf8.encode(outboundText).length > maxBytes) {
+        showDismissibleSnackBar(
+          context,
+          content: Text(context.l10n.chat_messageTooLong(maxBytes)),
+        );
+        return;
+      }
+
+      // When messageText is transformed with cyr2lat, it (generally) hasn't visual differences,
+      // but we getting messages doubles in chat screen (source text and transformed).
+      // To prevent, we'll perform transform of source before pass to main sender logic.
+      // We can pass whole text, senderName will be kept intact
+      if (connector.isChannelCyr2LatEnabled(widget.channel.index)) {
+        messageText = Cyr2Lat.encode(messageText);
+      }
+      // end transform
     }
-    // end transform
 
     _textController.clear();
     _cancelReply();
@@ -2112,9 +2160,9 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             BottomSheetHeader(
-              title: message.text.length > 40
-                  ? '${message.text.substring(0, 40)}…'
-                  : message.text,
+              title: message.displayText.length > 40
+                  ? '${message.displayText.substring(0, 40)}…'
+                  : message.displayText,
               subtitle: message.senderName.isNotEmpty
                   ? message.senderName
                   : null,
@@ -2150,7 +2198,7 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
               title: Text(context.l10n.common_copy),
               onTap: () {
                 Navigator.pop(sheetContext);
-                _copyMessageText(message.text);
+                _copyMessageText(message.displayText);
               },
             ),
             if (canTranslateMessage)

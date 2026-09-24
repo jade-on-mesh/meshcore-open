@@ -14,12 +14,15 @@ import '../models/channel_message.dart';
 import '../models/companion_radio_stats.dart';
 import '../models/contact.dart';
 import '../models/message.dart';
+import '../models/otp_pad.dart';
 import '../models/path_selection.dart';
 import '../models/translation_support.dart';
 import '../helpers/reaction_helper.dart';
 import '../helpers/cyr2lat.dart';
 import '../helpers/smaz.dart';
+import '../storage/otp_pad_store.dart';
 import '../services/app_debug_log_service.dart';
+import '../services/otp_service.dart';
 import '../services/ble_debug_log_service.dart';
 import '../services/linux_ble_error_classifier.dart';
 import '../services/linux_ble_pairing_service_stub.dart'
@@ -368,6 +371,7 @@ class MeshCoreConnector extends ChangeNotifier {
   final ChannelSettingsStore _channelSettingsStore = ChannelSettingsStore();
   final ChannelRegionStore _channelRegionStore = ChannelRegionStore();
   final ContactSettingsStore _contactSettingsStore = ContactSettingsStore();
+  final OtpPadStore _otpPadStore = OtpPadStore();
   final ContactStore _contactStore = ContactStore();
   final ContactDiscoveryStore _discoveryContactStore = ContactDiscoveryStore();
   final ChannelStore _channelStore = ChannelStore();
@@ -378,12 +382,27 @@ class MeshCoreConnector extends ChangeNotifier {
   final Map<int, bool> _channelUrlImagesEnabled = {};
   final Map<int, String?> _channelCyr2LatProfileId = {};
   final Map<int, Region> _channelRegions = {};
+  final Map<int, OtpPad?> _channelOtpPads = {};
+  // Keyed by the raw "OTP1|<hex>" ciphertext string. Channel messages can
+  // arrive via two independent paths — RESP_CODE_CHANNEL_MSG_RECV and the
+  // raw RX packet log (pushCodeLogRxData → _handleLogRxData), decoded
+  // separately from the same physical packet — and both can fire for one
+  // logical message. Since OTP ciphertext is effectively unique per message
+  // (pad-derived, never repeats), caching by ciphertext lets the second
+  // delivery reuse the first's result instead of decrypting again and
+  // silently burning a second slice of pad for something already decoded.
+  // Capped and FIFO-trimmed; this only needs to outlive brief redelivery
+  // windows, not the whole session.
+  static const int _otpDecryptCacheLimit = 64;
+  final Map<String, String> _otpDecryptCache = {};
+  final List<String> _otpDecryptCacheOrder = [];
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
   final Map<String, bool> _contactCyr2LatEnabled = {};
   final Map<String, bool> _contactUrlImagesEnabled = {};
   final Map<String, String?> _contactCyr2LatProfileId = {};
+  final Map<String, OtpPad?> _contactOtpPads = {};
   final Set<String> _knownContactKeys = {};
   final Map<String, int> _contactUnreadCount = {};
   final Map<String, RepeaterBatterySnapshot> _repeaterBatterySnapshots = {};
@@ -621,7 +640,11 @@ class MeshCoreConnector extends ChangeNotifier {
     await deleteMessage(message);
     await sendMessage(
       contact,
-      message.text,
+      // A manual resend is a deliberate new send, not an automatic retry —
+      // re-encrypt from the original plaintext (spending a fresh slice of
+      // pad) rather than replaying `message.text`, which for an OTP
+      // message is already-spent ciphertext.
+      message.otpPlaintext ?? message.text,
       originalText: message.originalText,
       translatedLanguageCode: message.translatedLanguageCode,
       translationModelId: message.translationModelId,
@@ -824,6 +847,208 @@ class MeshCoreConnector extends ChangeNotifier {
 
   void ensureContactCyr2LatSettingLoaded(String contactKeyHex) {
     _ensureContactCyr2LatSettingLoaded(contactKeyHex);
+  }
+
+  // ── OTP ────────────────────────────────────────────────────────────────
+  // Unlike the Smaz/Cyr2Lat loaders above (which wrap a technically-async
+  // SharedPreferences read in a Future for historical reasons), pad reads
+  // are written as plain synchronous getters — PrefsManager's underlying
+  // SharedPreferences instance is already memory-resident by the time the
+  // connector can be scoped to a self key, so there's nothing to await.
+
+  OtpPad? getContactOtpPad(String contactKeyHex) {
+    if (!_contactOtpPads.containsKey(contactKeyHex)) {
+      _contactOtpPads[contactKeyHex] = _otpPadStore.loadContactPad(
+        contactKeyHex,
+      );
+    }
+    return _contactOtpPads[contactKeyHex];
+  }
+
+  OtpPad? getChannelOtpPad(int channelIndex) {
+    if (!_channelOtpPads.containsKey(channelIndex)) {
+      _channelOtpPads[channelIndex] = _otpPadStore.loadChannelPad(
+        channelIndex,
+      );
+    }
+    return _channelOtpPads[channelIndex];
+  }
+
+  bool isContactOtpEnabled(String contactKeyHex) {
+    final pad = getContactOtpPad(contactKeyHex);
+    return pad != null && pad.enabled;
+  }
+
+  bool isChannelOtpEnabled(int channelIndex) {
+    final pad = getChannelOtpPad(channelIndex);
+    return pad != null && pad.enabled;
+  }
+
+  /// Imports/replaces the pad for a contact and enables OTP for them.
+  /// [padHex] is the shared secret pad material as hex (however it was
+  /// obtained — pasted or scanned from a QR code). Overwrites any existing
+  /// pad and resets both offsets to zero: only do this for a genuinely new
+  /// pad, never to "fix" a desync, since that reuses already-spent bytes.
+  Future<void> setContactOtpPad(
+    String contactKeyHex,
+    String padHex,
+    OtpPadRole role, {
+    String? label,
+  }) async {
+    final pad = OtpPad(
+      padHex: padHex,
+      role: role,
+      enabled: true,
+      label: label,
+      importedAt: DateTime.now(),
+    );
+    _contactOtpPads[contactKeyHex] = pad;
+    await _otpPadStore.saveContactPad(contactKeyHex, pad);
+    notifyListeners();
+  }
+
+  Future<void> setChannelOtpPad(
+    int channelIndex,
+    String padHex,
+    OtpPadRole role, {
+    String? label,
+  }) async {
+    final pad = OtpPad(
+      padHex: padHex,
+      role: role,
+      enabled: true,
+      label: label,
+      importedAt: DateTime.now(),
+    );
+    _channelOtpPads[channelIndex] = pad;
+    await _otpPadStore.saveChannelPad(channelIndex, pad);
+    notifyListeners();
+  }
+
+  Future<void> setContactOtpEnabled(String contactKeyHex, bool enabled) async {
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) return;
+    final updated = pad.copyWith(enabled: enabled);
+    _contactOtpPads[contactKeyHex] = updated;
+    await _otpPadStore.saveContactPad(contactKeyHex, updated);
+    notifyListeners();
+  }
+
+  Future<void> setChannelOtpEnabled(int channelIndex, bool enabled) async {
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) return;
+    final updated = pad.copyWith(enabled: enabled);
+    _channelOtpPads[channelIndex] = updated;
+    await _otpPadStore.saveChannelPad(channelIndex, updated);
+    notifyListeners();
+  }
+
+  Future<void> clearContactOtpPad(String contactKeyHex) async {
+    _contactOtpPads[contactKeyHex] = null;
+    await _otpPadStore.clearContactPad(contactKeyHex);
+    notifyListeners();
+  }
+
+  Future<void> clearChannelOtpPad(int channelIndex) async {
+    _channelOtpPads[channelIndex] = null;
+    await _otpPadStore.clearChannelPad(channelIndex);
+    notifyListeners();
+  }
+
+  /// Encrypts [plaintext] for [contact], advancing and persisting the pad
+  /// offset. Called exactly once per logical message — see the note on
+  /// `sendMessage` for why this must never run again on retry.
+  Future<String> _encryptForContact(Contact contact, String plaintext) async {
+    final contactKeyHex = contact.publicKeyHex;
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) {
+      throw OtpPadExhaustedException(neededBytes: 0, availableBytes: 0);
+    }
+    final needed = OtpService.plaintextByteLength(plaintext);
+    final keyBytes = pad.takeMyKeyBytes(needed);
+    final ciphertext = OtpService.encrypt(plaintext, keyBytes);
+    final updated = pad.copyWith(myOffset: pad.myOffset + needed);
+    _contactOtpPads[contactKeyHex] = updated;
+    await _otpPadStore.saveContactPad(contactKeyHex, updated);
+    return ciphertext;
+  }
+
+  Future<String> _encryptForChannel(int channelIndex, String plaintext) async {
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) {
+      throw OtpPadExhaustedException(neededBytes: 0, availableBytes: 0);
+    }
+    final needed = OtpService.plaintextByteLength(plaintext);
+    final keyBytes = pad.takeMyKeyBytes(needed);
+    final ciphertext = OtpService.encrypt(plaintext, keyBytes);
+    final updated = pad.copyWith(myOffset: pad.myOffset + needed);
+    _channelOtpPads[channelIndex] = updated;
+    await _otpPadStore.saveChannelPad(channelIndex, updated);
+    return ciphertext;
+  }
+
+  /// Decrypts an incoming OTP payload from [contact], advancing and
+  /// persisting the receive-side offset. Returns null if this contact
+  /// doesn't have OTP set up (payload is shown as raw ciphertext — better
+  /// than silently dropping a message the user might still want to see) or
+  /// if decryption fails outright.
+  /// Records that [ciphertext] decrypted to [plaintext], so a redelivery of
+  /// the same message via a different receive path reuses the result
+  /// instead of decrypting (and consuming pad) again.
+  void _rememberOtpDecrypt(String ciphertext, String plaintext) {
+    if (_otpDecryptCache.containsKey(ciphertext)) return;
+    _otpDecryptCache[ciphertext] = plaintext;
+    _otpDecryptCacheOrder.add(ciphertext);
+    if (_otpDecryptCacheOrder.length > _otpDecryptCacheLimit) {
+      final oldest = _otpDecryptCacheOrder.removeAt(0);
+      _otpDecryptCache.remove(oldest);
+    }
+  }
+
+  String? _decryptFromContact(String contactKeyHex, String payload) {
+    if (!OtpService.isOtpPayload(payload)) return null;
+    final cached = _otpDecryptCache[payload];
+    if (cached != null) return cached;
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) return null;
+    try {
+      final hexLen = payload.length - OtpService.marker.length;
+      final cipherByteLen = hexLen ~/ 2;
+      final keyBytes = pad.takeTheirKeyBytes(cipherByteLen);
+      final plaintext = OtpService.decrypt(payload, keyBytes);
+      if (plaintext == null) return null;
+      final updated = pad.copyWith(theirOffset: pad.theirOffset + cipherByteLen);
+      _contactOtpPads[contactKeyHex] = updated;
+      unawaited(_otpPadStore.saveContactPad(contactKeyHex, updated));
+      _rememberOtpDecrypt(payload, plaintext);
+      return plaintext;
+    } catch (e) {
+      appLogger.warn('OTP decrypt failed for contact $contactKeyHex: $e');
+      return null;
+    }
+  }
+
+  String? _decryptFromChannel(int channelIndex, String payload) {
+    if (!OtpService.isOtpPayload(payload)) return null;
+    final cached = _otpDecryptCache[payload];
+    if (cached != null) return cached;
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) return null;
+    try {
+      final hexLen = payload.length - OtpService.marker.length;
+      final cipherByteLen = hexLen ~/ 2;
+      final keyBytes = pad.takeTheirKeyBytes(cipherByteLen);
+      final plaintext = OtpService.decrypt(payload, keyBytes);
+      if (plaintext == null) return null;
+      final updated = pad.copyWith(theirOffset: pad.theirOffset + cipherByteLen);
+      _channelOtpPads[channelIndex] = updated;
+      unawaited(_otpPadStore.saveChannelPad(channelIndex, updated));
+      _rememberOtpDecrypt(payload, plaintext);
+      return plaintext;
+    } catch (e) {
+      appLogger.warn('OTP decrypt failed for channel $channelIndex: $e');
+      return null;
+    }
   }
 
   Future<void> loadUnreadState() async {
@@ -3177,8 +3402,42 @@ class MeshCoreConnector extends ChangeNotifier {
   }) async {
     if (!isConnected || text.isEmpty) return;
 
+    // Check if this is a reaction - apply locally with pending status and route through retry service
+    final reactionInfo = ReactionHelper.parseReaction(text);
+
+    // OTP: reactions are always sent in the clear (they're tiny emoji-coded
+    // acks, not secret) — only real message text gets encrypted here.
+    //
+    // This MUST happen exactly once, right here, before `text` is ever
+    // handed to the retry service. prepareContactOutboundText's OTP1|
+    // bypass (above) makes every later call on the resulting ciphertext a
+    // no-op, but the encryption step itself is stateful — it advances the
+    // pad offset — so if it ran again on every retry attempt it would burn
+    // a fresh slice of pad per attempt and produce a DIFFERENT ciphertext
+    // each time. The firmware's ACK hash is computed from the outbound
+    // text, so retries must resend byte-identical frames; encrypting once
+    // and reusing the result is what makes that true.
+    String wireText = text;
+    String? otpPlaintext;
+    if (reactionInfo == null &&
+        !OtpService.isOtpPayload(text) &&
+        isContactOtpEnabled(contact.publicKeyHex)) {
+      try {
+        wireText = await _encryptForContact(contact, text);
+        otpPlaintext = text;
+      } on OtpPadExhaustedException catch (e) {
+        // Fail closed: never fall through and send plaintext. The UI's
+        // compose-box preflight check should catch this before the user
+        // even gets here, but this is the last line of defense.
+        appLogger.warn(
+          'sendMessage: OTP pad exhausted for ${contact.publicKeyHex}: $e',
+        );
+        return;
+      }
+    }
+
     final outboundBytes = utf8.encode(
-      prepareContactOutboundText(contact, text),
+      prepareContactOutboundText(contact, wireText),
     );
     if (outboundBytes.length > maxTextPayloadBytes) {
       debugPrint(
@@ -3188,8 +3447,6 @@ class MeshCoreConnector extends ChangeNotifier {
       return;
     }
 
-    // Check if this is a reaction - apply locally with pending status and route through retry service
-    final reactionInfo = ReactionHelper.parseReaction(text);
     if (reactionInfo != null) {
       appLogger.info('Sending reaction: ${reactionInfo.identifier()}');
       _conversations.putIfAbsent(contact.publicKeyHex, () => []);
@@ -3224,26 +3481,28 @@ class MeshCoreConnector extends ChangeNotifier {
     if (_retryService != null) {
       await _retryService!.sendMessageWithRetry(
         contact: contact,
-        text: text,
+        text: wireText,
         originalText: originalText,
         translatedLanguageCode: translatedLanguageCode,
         translationModelId: translationModelId,
+        otpPlaintext: otpPlaintext,
       );
     } else {
       // Fallback to old behavior if retry service not initialized
       final resolved = resolvePathSelection(contact);
       final message = Message.outgoing(
         contact.publicKey,
-        text,
+        wireText,
         pathLength: resolved.useFlood ? -1 : resolved.hopCount,
         pathBytes: Uint8List.fromList(resolved.pathBytes),
         originalText: originalText,
         translatedLanguageCode: translatedLanguageCode,
         translationModelId: translationModelId,
+        otpPlaintext: otpPlaintext,
       );
       _addMessage(contact.publicKeyHex, message); // recipient as "sender"
       notifyListeners();
-      final outboundText = prepareContactOutboundText(contact, text);
+      final outboundText = prepareContactOutboundText(contact, wireText);
       await sendFrame(buildSendTextMsgFrame(contact.publicKey, outboundText));
     }
   }
@@ -3624,19 +3883,38 @@ class MeshCoreConnector extends ChangeNotifier {
       // we continue to process it normally.
     }
 
+    // OTP: same reasoning as sendMessage() above — encrypt exactly once,
+    // here, before either the locally-stored message or the outbound frame
+    // is built, so both derive from the same ciphertext.
+    String wireText = text;
+    String? otpPlaintext;
+    if (!OtpService.isOtpPayload(text) && isChannelOtpEnabled(channel.index)) {
+      try {
+        wireText = await _encryptForChannel(channel.index, text);
+        otpPlaintext = text;
+      } on OtpPadExhaustedException catch (e) {
+        appLogger.warn(
+          'sendChannelMessage: OTP pad exhausted for channel '
+          '${channel.index}: $e',
+        );
+        return;
+      }
+    }
+
     final message = ChannelMessage.outgoing(
-      text,
+      wireText,
       _selfName ?? 'Me',
       channel.index,
       originalText: originalText,
       translatedLanguageCode: translatedLanguageCode,
       translationModelId: translationModelId,
+      otpPlaintext: otpPlaintext,
     );
     _addChannelMessage(channel.index, message);
     _pendingChannelSentQueue.add(message.messageId);
     notifyListeners();
 
-    final outboundText = prepareChannelOutboundText(channel.index, text);
+    final outboundText = prepareChannelOutboundText(channel.index, wireText);
     await _runScopedChannelSend(() async {
       await _waitForRadioQuiet(lastInboundRxTime: _lastChannelMsgRxTime);
       await _sendFrameAndWaitForCommandAck(
@@ -4631,6 +4909,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _channelSettingsStore.setPublicKeyHex = selfPublicKeyHex;
     _channelRegionStore.setPublicKeyHex = selfPublicKeyHex;
     _contactSettingsStore.setPublicKeyHex = selfPublicKeyHex;
+    _otpPadStore.setPublicKeyHex = selfPublicKeyHex;
     _contactStore.setPublicKeyHex = selfPublicKeyHex;
     _channelStore.setPublicKeyHex = selfPublicKeyHex;
     _unreadStore.setPublicKeyHex = selfPublicKeyHex;
@@ -5462,7 +5741,7 @@ class MeshCoreConnector extends ChangeNotifier {
         appLogger.warn('Received message with empty text, ignoring');
         return null;
       }
-      final decodedText = isCli
+      var decodedText = isCli
           ? msgText
           : (Smaz.tryDecodePrefixed(msgText) ?? msgText);
 
@@ -5475,6 +5754,23 @@ class MeshCoreConnector extends ChangeNotifier {
           'Received message from unknown contact with prefix: ${senderPrefix.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join('')}',
         );
         return null;
+      }
+
+      // OTP: decrypt in place, once, right here — this Message object and
+      // its `text` flow into every downstream render/notification/search
+      // call site unchanged, so this is the only place this needs to happen.
+      if (!isCli && OtpService.isOtpPayload(decodedText)) {
+        if (getContactOtpPad(contact.publicKeyHex) == null) {
+          decodedText =
+              '🔒 Encrypted message — no OTP pad set up for this contact';
+        } else {
+          final plaintext = _decryptFromContact(
+            contact.publicKeyHex,
+            decodedText,
+          );
+          decodedText =
+              plaintext ?? '🔒 Could not decrypt — pad may be out of sync';
+        }
       }
 
       return Message(
@@ -5608,7 +5904,8 @@ class MeshCoreConnector extends ChangeNotifier {
     final isStructuredPayload =
         trimmed.startsWith('g:') ||
         trimmed.startsWith('m:') ||
-        trimmed.startsWith('V1|');
+        trimmed.startsWith('V1|') ||
+        trimmed.startsWith(OtpService.marker);
     if (!isStructuredPayload) {
       if (isContactSmazEnabled(contact.publicKeyHex)) {
         return Smaz.encodeIfSmaller(text);
@@ -5636,7 +5933,9 @@ class MeshCoreConnector extends ChangeNotifier {
   String prepareChannelOutboundText(int channelIndex, String text) {
     final trimmed = text.trim();
     final isStructuredPayload =
-        trimmed.startsWith('g:') || trimmed.startsWith('m:');
+        trimmed.startsWith('g:') ||
+        trimmed.startsWith('m:') ||
+        trimmed.startsWith(OtpService.marker);
     if (!isStructuredPayload) {
       if (isChannelSmazEnabled(channelIndex)) {
         return Smaz.encodeIfSmaller(text);
@@ -5724,10 +6023,27 @@ class MeshCoreConnector extends ChangeNotifier {
     if (_isSyncingQueuedMessages) {
       _handleQueuedMessageReceived();
     }
-    final parsed = ChannelMessage.fromFrame(frame);
+    var parsed = ChannelMessage.fromFrame(frame);
     if (parsed != null && parsed.channelIndex != null) {
       if (_shouldDropSelfChannelMessage(parsed.senderName, parsed.pathBytes)) {
         return;
+      }
+      // OTP: decrypt in place, once, right here, same reasoning as the
+      // contact-message path in _parseContactMessage above.
+      if (OtpService.isOtpPayload(parsed.text)) {
+        if (getChannelOtpPad(parsed.channelIndex!) == null) {
+          parsed = parsed.copyWith(
+            text: '🔒 Encrypted message — no OTP pad set up for this channel',
+          );
+        } else {
+          final plaintext = _decryptFromChannel(
+            parsed.channelIndex!,
+            parsed.text,
+          );
+          parsed = parsed.copyWith(
+            text: plaintext ?? '🔒 Could not decrypt — pad may be out of sync',
+          );
+        }
       }
       _lastChannelMsgRxTime = DateTime.now();
       final contentHash = _computeContentHash(
@@ -5796,8 +6112,27 @@ class MeshCoreConnector extends ChangeNotifier {
 
           final text = decrypted.readCString();
           final parsed = _splitSenderText(text);
-          final decodedText =
-              Smaz.tryDecodePrefixed(parsed.text) ?? parsed.text;
+          var decodedText = Smaz.tryDecodePrefixed(parsed.text) ?? parsed.text;
+
+          // OTP: this is the second, independent channel-receive path (raw
+          // RX log data, decoded straight from the channel PSK rather than
+          // via RESP_CODE_CHANNEL_MSG_RECV) — needs the same decrypt hook
+          // as _handleIncomingChannelMessage, since either path can be the
+          // one that actually delivers a given message.
+          if (OtpService.isOtpPayload(decodedText)) {
+            if (getChannelOtpPad(channel.index) == null) {
+              decodedText =
+                  '🔒 Encrypted message — no OTP pad set up for this channel';
+            } else {
+              final plaintext = _decryptFromChannel(
+                channel.index,
+                decodedText,
+              );
+              decodedText =
+                  plaintext ?? '🔒 Could not decrypt — pad may be out of sync';
+            }
+          }
+
           if (_shouldDropSelfChannelMessage(
             parsed.senderName,
             packet.pathBytes,

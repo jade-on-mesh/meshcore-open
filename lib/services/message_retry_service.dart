@@ -152,6 +152,7 @@ class MessageRetryService extends ChangeNotifier {
     String? originalText,
     String? translatedLanguageCode,
     String? translationModelId,
+    String? otpPlaintext,
     Uint8List? pathBytes,
     int? pathLength,
   }) async {
@@ -163,10 +164,15 @@ class MessageRetryService extends ChangeNotifier {
         pathLength ?? (resolved.useFlood ? -1 : resolved.hopCount);
     final message = Message(
       senderKey: contact.publicKey,
+      // `text` is the stable OTP1|<hex> ciphertext when OTP is active for
+      // this contact — it must never change across retries (see the note
+      // in meshcore_connector.dart's sendMessage). `otpPlaintext` carries
+      // what the sender actually typed, purely for their own sent bubble.
       text: text,
       originalText: originalText,
       translatedLanguageCode: translatedLanguageCode,
       translationModelId: translationModelId,
+      otpPlaintext: otpPlaintext,
       timestamp: DateTime.now(),
       isOutgoing: true,
       status: MessageStatus.pending,

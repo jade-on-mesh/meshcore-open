@@ -27,12 +27,15 @@ import '../models/message.dart';
 import '../models/translation_support.dart';
 import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
+import '../services/otp_service.dart';
 import '../services/path_history_service.dart';
 import '../services/translation_service.dart';
+import '../theme/mesh_theme.dart';
 import '../widgets/chat_zoom_wrapper.dart';
 import '../widgets/byte_count_input.dart';
 import 'channel_message_path_screen.dart';
 import 'map_screen.dart';
+import 'otp_pad_screen.dart';
 import '../widgets/emoji_picker.dart';
 import '../widgets/gif_message.dart';
 import '../widgets/jump_to_bottom_button.dart';
@@ -230,6 +233,27 @@ class _ChatScreenState extends State<ChatScreen> {
         bottom: const SyncProgressAppBarBottom(),
         actions: [
           const RadioStatsIconButton(),
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) {
+              final contact = _resolveContact(connector);
+              final otpEnabled = connector.isContactOtpEnabled(
+                contact.publicKeyHex,
+              );
+              return IconButton(
+                tooltip: otpEnabled ? 'OTP Pad (encrypting)' : 'OTP Pad',
+                icon: Icon(
+                  otpEnabled ? Icons.lock : Icons.lock_open,
+                  color: otpEnabled ? MeshPalette.blue : null,
+                ),
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => OtpPadScreen.forContact(contact),
+                  ),
+                ),
+              );
+            },
+          ),
           Consumer<MeshCoreConnector>(
             builder: (context, connector, _) {
               final contact = _resolveContact(connector);
@@ -465,7 +489,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildInputBar(MeshCoreConnector connector) {
-    final maxBytes = maxContactMessageBytes();
+    final maxBytes = connector.isContactOtpEnabled(
+      _resolveContact(connector).publicKeyHex,
+    )
+        ? OtpService.maxPlaintextBytesForContact()
+        : maxContactMessageBytes();
     final scheme = Theme.of(context).colorScheme;
     final settings = context.watch<AppSettingsService>().settings;
     return Container(
@@ -709,30 +737,55 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       }
     }
-    final maxBytes = maxContactMessageBytes();
-    final outboundText = connector.prepareContactOutboundText(
-      _resolveContact(connector),
-      outgoingText,
+    final otpEnabled = connector.isContactOtpEnabled(
+      _resolveContact(connector).publicKeyHex,
     );
-    if (utf8.encode(outboundText).length > maxBytes) {
-      showDismissibleSnackBar(
-        context,
-        content: Text(context.l10n.chat_messageTooLong(maxBytes)),
-      );
-      return;
-    }
 
-    // This is only for cyr2lat compression - to see the message being sent in the same format as the other person will receive
-    try {
-      if (connector.isContactCyr2LatEnabled(
-        _resolveContact(connector).publicKeyHex,
-      )) {
-        outgoingText = Cyr2Lat.encode(outgoingText);
+    if (otpEnabled) {
+      // OTP budget check: the real limit is the encrypted, hex-doubled
+      // payload against the 160-byte packet ceiling, which is what
+      // OtpService.maxPlaintextBytesForContact() already accounts for —
+      // checking prepareContactOutboundText() here would be checking the
+      // wrong thing (that only transforms plaintext with Smaz/Cyr2Lat).
+      final maxPlainBytes = OtpService.maxPlaintextBytesForContact();
+      if (OtpService.plaintextByteLength(outgoingText) > maxPlainBytes) {
+        showDismissibleSnackBar(
+          context,
+          content: Text(context.l10n.chat_messageTooLong(maxPlainBytes)),
+        );
+        return;
       }
-    } catch (_) {
-      // TODO maybe log
+      // Skip Smaz/Cyr2Lat entirely — connector.sendMessage()'s OTP path
+      // encrypts outgoingText as-is, and prepareContactOutboundText already
+      // bypasses both transforms for OTP1|-prefixed ciphertext, so running
+      // Cyr2Lat here first would just transliterate the plaintext that's
+      // about to be encrypted, corrupting what the recipient decrypts to.
+    } else {
+      final maxBytes = maxContactMessageBytes();
+      final outboundText = connector.prepareContactOutboundText(
+        _resolveContact(connector),
+        outgoingText,
+      );
+      if (utf8.encode(outboundText).length > maxBytes) {
+        showDismissibleSnackBar(
+          context,
+          content: Text(context.l10n.chat_messageTooLong(maxBytes)),
+        );
+        return;
+      }
+
+      // This is only for cyr2lat compression - to see the message being sent in the same format as the other person will receive
+      try {
+        if (connector.isContactCyr2LatEnabled(
+          _resolveContact(connector).publicKeyHex,
+        )) {
+          outgoingText = Cyr2Lat.encode(outgoingText);
+        }
+      } catch (_) {
+        // TODO maybe log
+      }
+      // end transform
     }
-    // end transform
 
     _textController.clear();
     _textFieldFocusNode.requestFocus();
@@ -1170,9 +1223,9 @@ class _ChatScreenState extends State<ChatScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             BottomSheetHeader(
-              title: message.text.length > 40
-                  ? '${message.text.substring(0, 40)}…'
-                  : message.text,
+              title: message.displayText.length > 40
+                  ? '${message.displayText.substring(0, 40)}…'
+                  : message.displayText,
             ),
             // Can't react to your own messages
             if (!message.isOutgoing)
@@ -1197,7 +1250,7 @@ class _ChatScreenState extends State<ChatScreen> {
               title: Text(context.l10n.common_copy),
               onTap: () {
                 Navigator.pop(sheetContext);
-                _copyMessageText(message.text);
+                _copyMessageText(message.displayText);
               },
             ),
             if (canTranslateMessage)
@@ -1392,7 +1445,10 @@ class _MessageBubble extends StatelessWidget {
 
     // Do not strip room-server author bytes here: the parser stores them in
     // fourByteRoomContactKey, so message.text is safe to render as-is.
-    final messageText = message.text;
+    // displayText resolves to the sender's own typed plaintext for an
+    // outgoing OTP message (message.text is the ciphertext actually on the
+    // wire); for everything else it's just message.text unchanged.
+    final messageText = message.displayText;
     final translatedDisplayText =
         message.translatedText != null &&
             message.translatedText!.trim().isNotEmpty

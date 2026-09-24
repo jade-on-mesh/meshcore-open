@@ -52,6 +52,9 @@ class ChannelMessage {
   final String? replyToText;
   final Map<String, List<String?>> reactions;
 
+  // OTP: mirrors Message.otpPlaintext — see that field's doc comment.
+  final String? otpPlaintext;
+
   ChannelMessage({
     this.senderKey,
     required this.senderName,
@@ -61,6 +64,7 @@ class ChannelMessage {
     this.translatedLanguageCode,
     this.translationStatus = MessageTranslationStatus.none,
     this.translationModelId,
+    this.otpPlaintext,
     required this.timestamp,
     required this.isOutgoing,
     this.status = ChannelMessageStatus.pending,
@@ -90,7 +94,13 @@ class ChannelMessage {
   String? get senderKeyHex =>
       senderKey != null ? pubKeyToHex(senderKey!) : null;
 
+  /// See Message.displayText — same reasoning, channel-side.
+  String get displayText => otpPlaintext ?? text;
+
   ChannelMessage copyWith({
+    // Only ever used to replace ciphertext with plaintext after an OTP
+    // decrypt — every other call site leaves this null and keeps `text`.
+    String? text,
     ChannelMessageStatus? status,
     List<Repeat>? repeats,
     int? repeatCount,
@@ -107,12 +117,13 @@ class ChannelMessage {
     Object? translatedLanguageCode = _unset,
     MessageTranslationStatus? translationStatus,
     Object? translationModelId = _unset,
+    Object? otpPlaintext = _unset,
     Map<String, List<String?>>? reactions,
   }) {
     return ChannelMessage(
       senderKey: senderKey,
       senderName: senderName,
-      text: text,
+      text: text ?? this.text,
       originalText: originalText == _unset
           ? this.originalText
           : originalText as String?,
@@ -126,6 +137,9 @@ class ChannelMessage {
       translationModelId: translationModelId == _unset
           ? this.translationModelId
           : translationModelId as String?,
+      otpPlaintext: otpPlaintext == _unset
+          ? this.otpPlaintext
+          : otpPlaintext as String?,
       timestamp: timestamp,
       isOutgoing: isOutgoing,
       status: status ?? this.status,
@@ -238,6 +252,7 @@ class ChannelMessage {
     String? originalText,
     String? translatedLanguageCode,
     String? translationModelId,
+    String? otpPlaintext,
   }) {
     return ChannelMessage(
       senderKey: null,
@@ -246,6 +261,7 @@ class ChannelMessage {
       originalText: originalText,
       translatedLanguageCode: translatedLanguageCode,
       translationModelId: translationModelId,
+      otpPlaintext: otpPlaintext,
       timestamp: DateTime.now(),
       isOutgoing: true,
       status: ChannelMessageStatus.pending,

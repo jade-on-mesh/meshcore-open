@@ -20,6 +20,14 @@ class Message {
   final MessageTranslationStatus translationStatus;
   final String? translationModelId;
 
+  // OTP: for an outgoing message that was OTP-encrypted, `text` holds the
+  // stable "OTP1|<hex>" ciphertext actually placed on the wire (and resent
+  // verbatim on retries — see message_retry_service.dart), while this field
+  // holds what the sender actually typed, purely so their own sent bubble
+  // shows readable text instead of hex. Never set for incoming messages —
+  // those get decrypted in place, so `text` is already plaintext.
+  final String? otpPlaintext;
+
   // NEW: Retry logic fields
   final String messageId;
   final int retryCount;
@@ -47,6 +55,7 @@ class Message {
     this.translatedLanguageCode,
     this.translationStatus = MessageTranslationStatus.none,
     this.translationModelId,
+    this.otpPlaintext,
     this.retryCount = 0,
     this.estimatedTimeoutMs,
     this.expectedAckHash,
@@ -84,6 +93,7 @@ class Message {
     Object? translatedLanguageCode = _unset,
     MessageTranslationStatus? translationStatus,
     Object? translationModelId = _unset,
+    Object? otpPlaintext = _unset,
     Map<String, List<String?>>? reactions,
     Map<String, MessageStatus>? reactionStatuses,
     Uint8List? fourByteRoomContactKey,
@@ -109,6 +119,9 @@ class Message {
       translationModelId: translationModelId == _unset
           ? this.translationModelId
           : translationModelId as String?,
+      otpPlaintext: otpPlaintext == _unset
+          ? this.otpPlaintext
+          : otpPlaintext as String?,
       retryCount: retryCount ?? this.retryCount,
       estimatedTimeoutMs: estimatedTimeoutMs ?? this.estimatedTimeoutMs,
       expectedAckHash: expectedAckHash ?? this.expectedAckHash,
@@ -161,6 +174,7 @@ class Message {
     String? originalText,
     String? translatedLanguageCode,
     String? translationModelId,
+    String? otpPlaintext,
     int? pathLength,
     Uint8List? pathBytes,
   }) {
@@ -170,6 +184,7 @@ class Message {
       originalText: originalText,
       translatedLanguageCode: translatedLanguageCode,
       translationModelId: translationModelId,
+      otpPlaintext: otpPlaintext,
       timestamp: DateTime.now(),
       isOutgoing: true,
       isCli: false,
@@ -178,6 +193,12 @@ class Message {
       pathBytes: pathBytes,
     );
   }
+
+  /// What should actually be shown in the UI: the sender's own typed
+  /// plaintext for an OTP-encrypted outgoing message, otherwise `text` as
+  /// usual (already plaintext for everything else, including OTP messages
+  /// received from someone else — those are decrypted in place on arrival).
+  String get displayText => otpPlaintext ?? text;
 
   static ReactionInfo? parseReaction(String text) {
     return ReactionHelper.parseReaction(text);
