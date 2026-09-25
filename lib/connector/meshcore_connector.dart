@@ -477,6 +477,21 @@ class MeshCoreConnector extends ChangeNotifier {
   final Map<String, Timer> _otpResyncTimers = {};
   Timer? _otpAutoSyncPollTimer;
   static const Duration _otpAutoSyncPollInterval = Duration(seconds: 120);
+  // Airtime backoff: if a PERIODIC check gets no reply at all within
+  // _syncBackoffTimeout, the peer is probably unreachable right now (off,
+  // out of range, etc.) — polling it again every _otpAutoSyncPollInterval
+  // just burns airtime for no benefit. Once backed off, the periodic poll
+  // skips that target entirely until either something is heard from it
+  // again (a sync-check reply or a fresh check it sent on its own — see
+  // _maybeHandleContactSyncMessage/_maybeHandleChannelSyncMessage) or the
+  // person starts typing/reopens the chat/sends/receives (all funnel
+  // through _requestPromptContactSyncCheck/_requestPromptChannelSyncCheck,
+  // which lifts it). A manual "Check Sync" tap always still works — this
+  // only suppresses the automatic background probe.
+  final Set<String> _contactSyncBackoff = {};
+  final Set<int> _channelSyncBackoff = {};
+  final Map<String, Timer> _otpBackoffTimers = {};
+  static const Duration _syncBackoffTimeout = Duration(seconds: 30);
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
@@ -1052,6 +1067,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpResyncTimers.remove('rc:$contactKeyHex')?.cancel();
     _otpSyncTimeoutTimers.remove('c:$contactKeyHex')?.cancel();
     _lastPromptSyncCheckAt.remove('c:$contactKeyHex');
+    _clearContactSyncBackoff(contactKeyHex);
   }
 
   void _clearChannelSyncState(int channelIndex) {
@@ -1064,6 +1080,7 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     perChannel?.clear();
     _otpSyncTimeoutTimers.remove('s:$channelIndex')?.cancel();
+    _clearChannelSyncBackoff(channelIndex);
     _lastPromptSyncCheckAt.remove('s:$channelIndex');
   }
 
@@ -1314,6 +1331,10 @@ class MeshCoreConnector extends ChangeNotifier {
     if (!OtpSyncService.looksLikeSyncMessage(text)) return false;
     final payload = OtpSyncService.parse(text);
     if (payload == null) return true;
+    // Any sync-check from this contact — a reply to one of ours, or one
+    // they sent on their own — is proof they're actually reachable right
+    // now, so lift any airtime backoff in effect.
+    _clearContactSyncBackoff(contact.publicKeyHex);
     final pad = getContactOtpPad(contact.publicKeyHex);
     if (pad != null &&
         !pad.isSharedSequential &&
@@ -1381,6 +1402,7 @@ class MeshCoreConnector extends ChangeNotifier {
     if (!OtpSyncService.looksLikeSyncMessage(text)) return false;
     final payload = OtpSyncService.parse(text);
     if (payload == null) return true;
+    _clearChannelSyncBackoff(channelIndex);
     final pad = getChannelOtpPad(channelIndex);
     if (pad != null && payload.isSharedSequential) {
       final peerOffset = payload.offset ?? 0;
@@ -1569,14 +1591,45 @@ class MeshCoreConnector extends ChangeNotifier {
   void _pollActiveOtpSyncCheck() {
     final contactKeyHex = _activeContactKey;
     if (contactKeyHex != null &&
+        !_contactSyncBackoff.contains(contactKeyHex) &&
         getContactOtpPad(contactKeyHex)?.enabled == true) {
       checkContactPadSync(contactKeyHex);
+      _armSyncBackoffTimer(
+        'c:$contactKeyHex',
+        () => _contactSyncBackoff.add(contactKeyHex),
+      );
     }
     final channelIndex = _activeChannelIndex;
     if (channelIndex != null &&
+        !_channelSyncBackoff.contains(channelIndex) &&
         getChannelOtpPad(channelIndex)?.enabled == true) {
       checkChannelPadSync(channelIndex);
+      _armSyncBackoffTimer(
+        's:$channelIndex',
+        () => _channelSyncBackoff.add(channelIndex),
+      );
     }
+  }
+
+  void _armSyncBackoffTimer(String key, void Function() onTimeout) {
+    _otpBackoffTimers.remove(key)?.cancel();
+    _otpBackoffTimers[key] = Timer(_syncBackoffTimeout, onTimeout);
+  }
+
+  /// Lifts any airtime backoff in effect for [contactKeyHex]/[channelIndex]
+  /// — called whenever something is heard from that target (a sync-check
+  /// reply, or one it sent on its own) or the person starts typing/opens
+  /// the chat/sends/receives (see call sites of
+  /// _requestPromptContactSyncCheck/_requestPromptChannelSyncCheck and
+  /// _maybeHandleContactSyncMessage/_maybeHandleChannelSyncMessage).
+  void _clearContactSyncBackoff(String contactKeyHex) {
+    _contactSyncBackoff.remove(contactKeyHex);
+    _otpBackoffTimers.remove('c:$contactKeyHex')?.cancel();
+  }
+
+  void _clearChannelSyncBackoff(int channelIndex) {
+    _channelSyncBackoff.remove(channelIndex);
+    _otpBackoffTimers.remove('s:$channelIndex')?.cancel();
   }
 
   // Several independent events all want to "prompt a check soon": a
@@ -1609,6 +1662,10 @@ class MeshCoreConnector extends ChangeNotifier {
   /// periodic airtime budget above (see _shouldSendPromptSyncCheck for
   /// why a burst of these still only sends one).
   void _requestPromptContactSyncCheck(String contactKeyHex) {
+    // Typing, sending, receiving, and reopening the chat are all real
+    // signs of life for this conversation, so any of them lifts a
+    // previously-armed airtime backoff — see _clearContactSyncBackoff.
+    _clearContactSyncBackoff(contactKeyHex);
     if (getContactOtpPad(contactKeyHex)?.enabled == true &&
         _shouldSendPromptSyncCheck('c:$contactKeyHex')) {
       checkContactPadSync(contactKeyHex);
@@ -1616,6 +1673,7 @@ class MeshCoreConnector extends ChangeNotifier {
   }
 
   void _requestPromptChannelSyncCheck(int channelIndex) {
+    _clearChannelSyncBackoff(channelIndex);
     if (getChannelOtpPad(channelIndex)?.enabled == true &&
         _shouldSendPromptSyncCheck('s:$channelIndex')) {
       checkChannelPadSync(channelIndex);
@@ -8727,6 +8785,9 @@ class MeshCoreConnector extends ChangeNotifier {
       timer.cancel();
     }
     for (final timer in _otpResyncTimers.values) {
+      timer.cancel();
+    }
+    for (final timer in _otpBackoffTimers.values) {
       timer.cancel();
     }
     radioStatsNotifier.dispose();
