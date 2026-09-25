@@ -469,10 +469,24 @@ class MeshCoreConnector extends ChangeNotifier {
   // actually lost), a detected gap has to persist across the same value
   // for _resyncGracePeriod before it's acted on.
   static const Duration _resyncGracePeriod = Duration(seconds: 12);
-  final Map<String, ({int gap, DateTime firstSeen})> _pendingContactResync =
-      {};
-  // channelIndex -> senderName -> pending gap for that participant.
-  final Map<int, Map<String, ({int gap, DateTime firstSeen})>>
+  // What's tracked while waiting out the grace period is the PEER'S
+  // REPORTED ABSOLUTE OFFSET (peerOffset), not a fixed byte count taken
+  // at detection time. A byte count captured then would go stale if any
+  // of the "missing" messages turn out not to have been lost after all —
+  // still in flight, decrypting normally through the ordinary receive
+  // path at any point during the wait, which advances theirOffset/offset
+  // on its own, independently of this bookkeeping. Applying a stale byte
+  // count at expiry would then skip PAST bytes still needed for the next
+  // real message — corrupting it, permanently, since this correction
+  // only ever moves the receive counter forward. Recomputing the gap
+  // against the CURRENT offset right before acting (see
+  // _maybeAutoResyncContact/_maybeAutoResyncChannel) is what makes this
+  // safe: if the pad already caught up on its own, there's nothing left
+  // to do.
+  final Map<String, ({int peerOffset, DateTime firstSeen})>
+  _pendingContactResync = {};
+  // channelIndex -> senderName -> pending state for that participant.
+  final Map<int, Map<String, ({int peerOffset, DateTime firstSeen})>>
   _pendingChannelResync = {};
   final Map<String, Timer> _otpResyncTimers = {};
   Timer? _otpAutoSyncPollTimer;
@@ -1368,7 +1382,7 @@ class MeshCoreConnector extends ChangeNotifier {
       // (otherDrift) is THEIR receive lag, not fixable from here — it
       // resolves itself on their device via the identical logic once our
       // reply below reaches them.
-      _trackContactResyncGap(contact.publicKeyHex, peerMyOffset - pad.theirOffset);
+      _trackContactResyncGap(contact.publicKeyHex, peerMyOffset);
     }
     if (!payload.isReply && pad != null) {
       final reply = pad.isSharedSequential
@@ -1422,7 +1436,7 @@ class MeshCoreConnector extends ChangeNotifier {
       );
       // Same reasoning as the contact side: only auto-fix "I'm behind
       // this participant's reported offset" (peerOffset > pad.offset).
-      _trackChannelResyncGap(channelIndex, senderName, peerOffset - pad.offset);
+      _trackChannelResyncGap(channelIndex, senderName, peerOffset);
     }
     if (!payload.isReply && pad != null) {
       final reply = OtpSyncService.buildShared(
@@ -1445,16 +1459,23 @@ class MeshCoreConnector extends ChangeNotifier {
   // ── OTP pad auto-resync ────────────────────────────────────────────────
   // See the field doc on `_resyncGracePeriod` above for the full reasoning.
 
-  void _trackContactResyncGap(String contactKeyHex, int gap) {
+  void _trackContactResyncGap(String contactKeyHex, int peerMyOffset) {
     final timerKey = 'rc:$contactKeyHex';
+    final pad = getContactOtpPad(contactKeyHex);
+    final gap = peerMyOffset - (pad?.theirOffset ?? 0);
     if (gap <= 0) {
       _pendingContactResync.remove(contactKeyHex);
       _otpResyncTimers.remove(timerKey)?.cancel();
       return;
     }
     final existing = _pendingContactResync[contactKeyHex];
-    if (existing != null && existing.gap == gap) return; // same drift, timer already running
-    _pendingContactResync[contactKeyHex] = (gap: gap, firstSeen: DateTime.now());
+    if (existing != null && existing.peerOffset == peerMyOffset) {
+      return; // same reported offset, timer already running
+    }
+    _pendingContactResync[contactKeyHex] = (
+      peerOffset: peerMyOffset,
+      firstSeen: DateTime.now(),
+    );
     _otpResyncTimers[timerKey]?.cancel();
     _otpResyncTimers[timerKey] = Timer(
       _resyncGracePeriod,
@@ -1467,7 +1488,15 @@ class MeshCoreConnector extends ChangeNotifier {
     if (pending == null) return;
     final pad = getContactOtpPad(contactKeyHex);
     if (pad == null) return;
-    final gap = pending.gap;
+    // Recompute the gap against the CURRENT offset, not a byte count
+    // captured at detection time — see the doc on _pendingContactResync
+    // above. If real messages decrypted normally during the grace-period
+    // wait, theirOffset may already be partially or fully caught up on
+    // its own.
+    final gap = pending.peerOffset - pad.theirOffset;
+    if (gap <= 0) {
+      return; // caught up on its own - nothing left to fix
+    }
     if (pad.theirBytesRemaining < gap) {
       _contactOtpSyncStatus[contactKeyHex] =
           (_contactOtpSyncStatus[contactKeyHex] ??
@@ -1493,20 +1522,29 @@ class MeshCoreConnector extends ChangeNotifier {
     checkContactPadSync(contactKeyHex); // confirm we're actually caught up now
   }
 
-  void _trackChannelResyncGap(int channelIndex, String senderName, int gap) {
+  void _trackChannelResyncGap(
+    int channelIndex,
+    String senderName,
+    int peerOffset,
+  ) {
     final timerKey = 'rs:$channelIndex:$senderName';
     final perChannel = _pendingChannelResync.putIfAbsent(
       channelIndex,
       () => {},
     );
+    final pad = getChannelOtpPad(channelIndex);
+    final gap = peerOffset - (pad?.offset ?? 0);
     if (gap <= 0) {
       perChannel.remove(senderName);
       _otpResyncTimers.remove(timerKey)?.cancel();
       return;
     }
     final existing = perChannel[senderName];
-    if (existing != null && existing.gap == gap) return;
-    perChannel[senderName] = (gap: gap, firstSeen: DateTime.now());
+    if (existing != null && existing.peerOffset == peerOffset) return;
+    perChannel[senderName] = (
+      peerOffset: peerOffset,
+      firstSeen: DateTime.now(),
+    );
     _otpResyncTimers[timerKey]?.cancel();
     _otpResyncTimers[timerKey] = Timer(
       _resyncGracePeriod,
@@ -1520,7 +1558,12 @@ class MeshCoreConnector extends ChangeNotifier {
     if (pending == null) return;
     final pad = getChannelOtpPad(channelIndex);
     if (pad == null) return;
-    final gap = pending.gap;
+    // Recompute against the CURRENT shared offset, not the byte count
+    // captured at detection time — same reasoning as the contact side.
+    final gap = pending.peerOffset - pad.offset;
+    if (gap <= 0) {
+      return; // caught up on its own - nothing left to fix
+    }
     final statuses = _channelOtpSyncStatus.putIfAbsent(channelIndex, () => {});
     if (pad.myBytesRemaining < gap) {
       statuses[senderName] =
