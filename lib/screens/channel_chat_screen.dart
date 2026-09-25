@@ -558,9 +558,52 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
                 },
               ),
             ),
+            _buildPadStatusBar(),
             _buildInputBar(),
           ],
         ),
+      ),
+    );
+  }
+
+  // Matches the Wadamesh/Lua app's live "N bytes available" line just above
+  // the compose box (see refresh_chat_bytes() in OTP_3_RC1.lua) — this app
+  // otherwise only surfaces the pad budget on a separate screen (the lock
+  // icon → OtpPadScreen), one tap away and not visible while actually
+  // composing. Only shown for an OTP-enabled channel; hidden entirely
+  // otherwise, unlike Lua where the whole app is OTP-only. For a channel's
+  // shared-sequential pad there's one counter for everyone, same as the
+  // "Group usage" meter on OtpPadScreen — myBytesRemaining is that counter.
+  static const int _padLowBytesThreshold = 100;
+
+  Widget _buildPadStatusBar() {
+    final connector = context.watch<MeshCoreConnector>();
+    if (!connector.isChannelOtpEnabled(widget.channel.index)) {
+      return const SizedBox.shrink();
+    }
+    final pad = connector.getChannelOtpPad(widget.channel.index);
+    if (pad == null) return const SizedBox.shrink();
+    final remaining = pad.myBytesRemaining;
+    final scheme = Theme.of(context).colorScheme;
+    final String label;
+    final Color color;
+    if (remaining <= 0) {
+      label = 'Pad exhausted — import a new one to keep sending';
+      color = scheme.error;
+    } else if (remaining < _padLowBytesThreshold) {
+      label = '$remaining bytes available — running low';
+      color = scheme.tertiary;
+    } else {
+      label = '$remaining bytes available';
+      color = scheme.onSurfaceVariant;
+    }
+    return Container(
+      color: scheme.surface,
+      padding: const EdgeInsets.fromLTRB(14, 3, 14, 3),
+      alignment: Alignment.centerLeft,
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 11, color: color),
       ),
     );
   }
