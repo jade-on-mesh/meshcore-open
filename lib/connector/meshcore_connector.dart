@@ -2274,6 +2274,15 @@ class MeshCoreConnector extends ChangeNotifier {
         return;
       }
     }
+    // Re-check ownership after the await above (pad consumption + disk
+    // save) — if a second send for this same contact somehow started while
+    // this one was suspended there, it would have replaced this state in
+    // _pendingContactChunkSends already. Transmitting anyway would put a
+    // stale, already-superseded ciphertext chunk on the air using pad
+    // bytes real (unrelated) traffic may since have consumed past, and its
+    // own retry timer would keep re-sending it. See the identical guard on
+    // _sendCurrentChannelChunk for the fuller reasoning.
+    if (_pendingContactChunkSends[state.contact.publicKeyHex] != state) return;
     await _transmitContactChunkCipher(state.contact, state.currentCipherHex!);
     state.cancelRetryTimer();
     state.retryTimer = Timer(
@@ -2437,6 +2446,17 @@ class MeshCoreConnector extends ChangeNotifier {
         return;
       }
     }
+    // Re-check ownership after the await above (pad consumption + disk
+    // save) — if a second send for this same channel somehow started while
+    // this one was suspended there, it would have replaced this state in
+    // _pendingChannelChunkSends already (see sendChannelMessage/
+    // _sendChunkedChannelMessage's now-in-flight guard). Transmitting
+    // anyway would put a stale, already-superseded ciphertext chunk on the
+    // air against pad bytes real traffic may since have consumed past —
+    // silently corrupting the shared channel pad's sequential offset for
+    // every participant, not just this device — and its own retry timer
+    // would keep re-sending it indefinitely.
+    if (_pendingChannelChunkSends[state.channel.index] != state) return;
     await _transmitChannelChunkCipher(state.channel, state.currentCipherHex!);
     state.cancelRetryTimer();
     state.retryTimer = Timer(
@@ -4895,6 +4915,27 @@ class MeshCoreConnector extends ChangeNotifier {
     // each time. The firmware's ACK hash is computed from the outbound
     // text, so retries must resend byte-identical frames; encrypting once
     // and reusing the result is what makes that true.
+    // OTP: refuse to start a second encrypted send to this contact while
+    // one is already consuming pad (a chunked transfer in flight). Nothing
+    // previously stopped a double-tap of Send, or any other re-entrant
+    // call, from starting a second chunk-send state machine for the same
+    // contact — the newer one would silently replace the older one in
+    // _pendingContactChunkSends, but the older one's in-flight chunk keeps
+    // being encrypted/transmitted off the now-shared pad regardless,
+    // interleaving two messages' ciphertext on the air in an order that
+    // doesn't match the order it was encrypted in and permanently
+    // desyncing the receive side. Mirrors the Lua app's own `psend`/
+    // `queued_cipher` guard ("still sending the previous message").
+    if (reactionInfo == null &&
+        isContactOtpEnabled(contact.publicKeyHex) &&
+        _pendingContactChunkSends.containsKey(contact.publicKeyHex)) {
+      appLogger.warn(
+        'sendMessage: still sending the previous message to '
+        '${contact.publicKeyHex}, dropping this send',
+      );
+      return;
+    }
+
     if (reactionInfo == null && isContactOtpEnabled(contact.publicKeyHex)) {
       final plainBytes = Uint8List.fromList(utf8.encode(text));
       if (plainBytes.length > OtpService.maxPlaintextBytesForContact()) {
@@ -5375,6 +5416,21 @@ class MeshCoreConnector extends ChangeNotifier {
       }
       // It looks like a reaction, but we did not find its target, so
       // we continue to process it normally.
+    }
+
+    // OTP: refuse to start a second encrypted send to this channel while
+    // one is already consuming pad — see the identical guard and reasoning
+    // in sendMessage() above. Doubly important here: a channel pad is
+    // shared-sequential (one counter every participant must agree on), so
+    // corrupting its order doesn't just break this device, it desyncs
+    // everyone on the channel.
+    if (isChannelOtpEnabled(channel.index) &&
+        _pendingChannelChunkSends.containsKey(channel.index)) {
+      appLogger.warn(
+        'sendChannelMessage: still sending the previous message to '
+        'channel ${channel.index}, dropping this send',
+      );
+      return;
     }
 
     // OTP: same reasoning as sendMessage() above — encrypt exactly once,
