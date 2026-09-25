@@ -42,6 +42,16 @@ class Message {
   final Map<String, MessageStatus> reactionStatuses;
   final Uint8List fourByteRoomContactKey;
 
+  // OTP: only set while this outgoing message is an in-flight multi-part
+  // chunked send (see meshcore_connector.dart's _OtpContactChunkSend) —
+  // chunkIndex is the 0-based part currently being sent/awaiting its ack,
+  // chunkTotal the part count. Lets the UI show real progress ("2/5")
+  // instead of a generic pending spinner for the whole transfer. Stays
+  // set (and simply unused) once status leaves `pending`, since nothing
+  // renders it outside that state.
+  final int? chunkIndex;
+  final int? chunkTotal;
+
   Message({
     required this.senderKey,
     required this.text,
@@ -67,6 +77,8 @@ class Message {
     Uint8List? fourByteRoomContactKey,
     Map<String, List<String?>>? reactions,
     Map<String, MessageStatus>? reactionStatuses,
+    this.chunkIndex,
+    this.chunkTotal,
   }) : messageId =
            messageId ??
            '${timestamp.millisecondsSinceEpoch}_${pubKeyToHex(senderKey)}_${text.hashCode}',
@@ -97,6 +109,8 @@ class Message {
     Map<String, List<String?>>? reactions,
     Map<String, MessageStatus>? reactionStatuses,
     Uint8List? fourByteRoomContactKey,
+    int? chunkIndex,
+    int? chunkTotal,
   }) {
     return Message(
       senderKey: senderKey,
@@ -134,6 +148,8 @@ class Message {
       reactionStatuses: reactionStatuses ?? this.reactionStatuses,
       fourByteRoomContactKey:
           fourByteRoomContactKey ?? this.fourByteRoomContactKey,
+      chunkIndex: chunkIndex ?? this.chunkIndex,
+      chunkTotal: chunkTotal ?? this.chunkTotal,
     );
   }
 
@@ -177,6 +193,8 @@ class Message {
     String? otpPlaintext,
     int? pathLength,
     Uint8List? pathBytes,
+    int? chunkIndex,
+    int? chunkTotal,
   }) {
     return Message(
       senderKey: recipientKey,
@@ -191,6 +209,8 @@ class Message {
       status: MessageStatus.pending,
       pathLength: pathLength,
       pathBytes: pathBytes,
+      chunkIndex: chunkIndex,
+      chunkTotal: chunkTotal,
     );
   }
 

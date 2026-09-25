@@ -942,6 +942,22 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
                               ],
                               if (isOutgoing) ...[
                                 const SizedBox(width: 4),
+                                // Slick-UI: mirrors chat_screen.dart's DM
+                                // bubble — see Message.chunkIndex/chunkTotal
+                                // (ChannelMessage carries the same fields).
+                                if (message.status ==
+                                        ChannelMessageStatus.pending &&
+                                    message.chunkTotal != null &&
+                                    message.chunkTotal! > 1) ...[
+                                  Text(
+                                    '${(message.chunkIndex ?? 0) + 1}/${message.chunkTotal}',
+                                    style: MeshTheme.mono(
+                                      fontSize: 9.5 * textScale,
+                                      color: metaColor,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 2),
+                                ],
                                 MessageStatusIcon(
                                   isAcked:
                                       message.status ==

@@ -2224,7 +2224,9 @@ class MeshCoreConnector extends ChangeNotifier {
     final message = Message.outgoing(contact.publicKey, plaintext,
         originalText: originalText,
         translatedLanguageCode: translatedLanguageCode,
-        translationModelId: translationModelId);
+        translationModelId: translationModelId,
+        chunkIndex: 0,
+        chunkTotal: dataChunks.length);
     _addMessage(contact.publicKeyHex, message);
     notifyListeners();
 
@@ -2283,6 +2285,14 @@ class MeshCoreConnector extends ChangeNotifier {
     // own retry timer would keep re-sending it. See the identical guard on
     // _sendCurrentChannelChunk for the fuller reasoning.
     if (_pendingContactChunkSends[state.contact.publicKeyHex] != state) return;
+    // Slick-UI: keep the bubble's progress in step with which part is
+    // actually going out, not just a static "sending" — see
+    // Message.chunkIndex/chunkTotal.
+    _updateStoredContactMessage(
+      state.contact.publicKeyHex,
+      state.localMessageId,
+      (m) => m.copyWith(chunkIndex: state.sctr, chunkTotal: state.chunks.length),
+    );
     await _transmitContactChunkCipher(state.contact, state.currentCipherHex!);
     state.cancelRetryTimer();
     state.retryTimer = Timer(
@@ -2387,6 +2397,8 @@ class MeshCoreConnector extends ChangeNotifier {
       originalText: originalText,
       translatedLanguageCode: translatedLanguageCode,
       translationModelId: translationModelId,
+      chunkIndex: 0,
+      chunkTotal: dataChunks.length,
     );
     _addChannelMessage(channel.index, message);
     // Deliberately NOT added to _pendingChannelSentQueue: that FIFO is for
@@ -2457,6 +2469,14 @@ class MeshCoreConnector extends ChangeNotifier {
     // every participant, not just this device — and its own retry timer
     // would keep re-sending it indefinitely.
     if (_pendingChannelChunkSends[state.channel.index] != state) return;
+    // Slick-UI: keep the bubble's progress in step with which part is
+    // actually going out — see Message.chunkIndex/chunkTotal (mirrored
+    // here on ChannelMessage).
+    _updateStoredChannelMessage(
+      state.channel.index,
+      state.localMessageId,
+      (m) => m.copyWith(chunkIndex: state.sctr, chunkTotal: state.chunks.length),
+    );
     await _transmitChannelChunkCipher(state.channel, state.currentCipherHex!);
     state.cancelRetryTimer();
     state.retryTimer = Timer(

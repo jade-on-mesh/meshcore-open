@@ -55,6 +55,12 @@ class ChannelMessage {
   // OTP: mirrors Message.otpPlaintext — see that field's doc comment.
   final String? otpPlaintext;
 
+  // OTP: mirrors Message.chunkIndex/chunkTotal — see that field's doc
+  // comment. Set while this outgoing message is an in-flight multi-part
+  // chunked send on a channel (_OtpChannelChunkSend).
+  final int? chunkIndex;
+  final int? chunkTotal;
+
   ChannelMessage({
     this.senderKey,
     required this.senderName,
@@ -81,6 +87,8 @@ class ChannelMessage {
     this.replyToSenderName,
     this.replyToText,
     Map<String, List<String?>>? reactions,
+    this.chunkIndex,
+    this.chunkTotal,
   }) : messageId =
            messageId ??
            '${timestamp.millisecondsSinceEpoch}_${senderName.hashCode}_${text.hashCode}',
@@ -119,6 +127,8 @@ class ChannelMessage {
     Object? translationModelId = _unset,
     Object? otpPlaintext = _unset,
     Map<String, List<String?>>? reactions,
+    int? chunkIndex,
+    int? chunkTotal,
   }) {
     return ChannelMessage(
       senderKey: senderKey,
@@ -156,6 +166,8 @@ class ChannelMessage {
       replyToSenderName: replyToSenderName ?? this.replyToSenderName,
       replyToText: replyToText ?? this.replyToText,
       reactions: reactions ?? this.reactions,
+      chunkIndex: chunkIndex ?? this.chunkIndex,
+      chunkTotal: chunkTotal ?? this.chunkTotal,
     );
   }
 
@@ -253,6 +265,8 @@ class ChannelMessage {
     String? translatedLanguageCode,
     String? translationModelId,
     String? otpPlaintext,
+    int? chunkIndex,
+    int? chunkTotal,
   }) {
     return ChannelMessage(
       senderKey: null,
@@ -269,6 +283,8 @@ class ChannelMessage {
       pathBytes: Uint8List(0),
       pathVariants: const [],
       channelIndex: channelIndex,
+      chunkIndex: chunkIndex,
+      chunkTotal: chunkTotal,
     );
   }
 

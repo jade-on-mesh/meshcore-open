@@ -1738,6 +1738,24 @@ class _MessageBubble extends StatelessWidget {
                                 ),
                                 if (isOutgoing) ...[
                                   const SizedBox(width: 2),
+                                  // Slick-UI: a multi-part OTP send has a
+                                  // real part count while it's pending
+                                  // (Message.chunkIndex/chunkTotal) — show
+                                  // that instead of leaving the pending
+                                  // spinner as the only signal for what can
+                                  // be several seconds of transfer.
+                                  if (message.status == MessageStatus.pending &&
+                                      message.chunkTotal != null &&
+                                      message.chunkTotal! > 1) ...[
+                                    Text(
+                                      '${(message.chunkIndex ?? 0) + 1}/${message.chunkTotal}',
+                                      style: MeshTheme.mono(
+                                        fontSize: 9.5 * textScale,
+                                        color: metaColor,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 2),
+                                  ],
                                   MessageStatusIcon(
                                     size: 12 * textScale,
                                     onColor: metaColor,
