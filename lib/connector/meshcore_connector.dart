@@ -490,7 +490,16 @@ class MeshCoreConnector extends ChangeNotifier {
   _pendingChannelResync = {};
   final Map<String, Timer> _otpResyncTimers = {};
   Timer? _otpAutoSyncPollTimer;
-  static const Duration _otpAutoSyncPollInterval = Duration(seconds: 120);
+  // Widened from 120s (2min) to 300s (5min), matching the Lua side's
+  // AUTO_SYNC_INTERVAL_MS. A send, a receive, opening the chat, or focusing
+  // the compose box already fire an event-driven check right when drift is
+  // actually likely (see _requestPromptContactSyncCheck/
+  // _requestPromptChannelSyncCheck), so this periodic timer only exists to
+  // catch the rare "nothing happened for a while but we drifted anyway"
+  // case — it doesn't need to be frequent, and every extra tick is one
+  // more transmission that can collide with real chunk traffic on a busy
+  // mesh.
+  static const Duration _otpAutoSyncPollInterval = Duration(seconds: 300);
   // Airtime backoff: if a PERIODIC check gets no reply at all within
   // _syncBackoffTimeout, the peer is probably unreachable right now (off,
   // out of range, etc.) — polling it again every _otpAutoSyncPollInterval
@@ -7547,7 +7556,11 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     var parsed = ChannelMessage.fromFrame(frame);
     if (parsed != null && parsed.channelIndex != null) {
-      if (_shouldDropSelfChannelMessage(parsed.senderName, parsed.pathBytes)) {
+      if (_shouldDropSelfChannelMessage(
+        parsed.senderName,
+        parsed.pathBytes,
+        channelIndex: parsed.channelIndex,
+      )) {
         return;
       }
       // Pad sync-check control messages (see the note in
@@ -7656,6 +7669,7 @@ class MeshCoreConnector extends ChangeNotifier {
           if (_shouldDropSelfChannelMessage(
             parsed.senderName,
             packet.pathBytes,
+            channelIndex: channel.index,
           )) {
             return;
           }
@@ -8618,7 +8632,11 @@ class MeshCoreConnector extends ChangeNotifier {
     return false;
   }
 
-  bool _shouldDropSelfChannelMessage(String senderName, Uint8List pathBytes) {
+  bool _shouldDropSelfChannelMessage(
+    String senderName,
+    Uint8List pathBytes, {
+    int? channelIndex,
+  }) {
     final trimmed = senderName.trim();
     if (trimmed.isEmpty) return false;
 
@@ -8628,9 +8646,25 @@ class MeshCoreConnector extends ChangeNotifier {
     // If sender name doesn't match, keep the message
     if (trimmed != selfName) return false;
 
-    // Name matches - this is from self
-    // Drop only if pathBytes is empty (direct broadcast)
-    // Keep if pathBytes has data (repeated through another node)
+    // Name matches - this is from self.
+    //
+    // For an OTP-enabled channel, always drop it, hop count or not. A
+    // self-echo repeated back through another node still carries the exact
+    // ciphertext we already burned pad on when we sent it; letting it reach
+    // _dispatchOtpChannel would consume ANOTHER slice of the (forward-only,
+    // shared-sequential) channel pad against our own message, permanently
+    // desyncing us from every other participant even though nothing is
+    // actually wrong. There's no legitimate reason two different senders on
+    // the same OTP channel would share our exact self-name, so this can't
+    // drop someone else's real message.
+    if (channelIndex != null && getChannelOtpPad(channelIndex)?.enabled == true) {
+      return true;
+    }
+
+    // Plaintext channel: keep the old, non-OTP behavior. Drop only if
+    // pathBytes is empty (direct broadcast); keep it if pathBytes has data
+    // (repeated through another node), since that's useful confirmation the
+    // message actually propagated.
     return pathBytes.isEmpty;
   }
 
