@@ -1384,7 +1384,18 @@ class MeshCoreConnector extends ChangeNotifier {
       // reply below reaches them.
       _trackContactResyncGap(contact.publicKeyHex, peerMyOffset);
     }
-    if (!payload.isReply && pad != null) {
+    // Real hardware bug found in production: this reply used to fire
+    // unconditionally for every original (non-reply) sync-check heard, no
+    // throttle at all — so mesh-level packet retransmission, or another
+    // contact/channel participant checking in again, produced its own
+    // immediate, un-cooled-down radio transmission stacking on top of real
+    // message chunk/ack traffic, tripping the firmware's "too fast" rate
+    // limit. Sharing _shouldSendPromptSyncCheck's cooldown key with the
+    // prompted/periodic checks means a reply just sent counts toward the
+    // same floor those already respect.
+    if (!payload.isReply &&
+        pad != null &&
+        _shouldSendPromptSyncCheck('c:${contact.publicKeyHex}')) {
       final reply = pad.isSharedSequential
           ? OtpSyncService.buildShared(isReply: true, offset: pad.offset)
           : OtpSyncService.buildTwoParty(
@@ -1438,7 +1449,16 @@ class MeshCoreConnector extends ChangeNotifier {
       // this participant's reported offset" (peerOffset > pad.offset).
       _trackChannelResyncGap(channelIndex, senderName, peerOffset);
     }
-    if (!payload.isReply && pad != null) {
+    // See the matching comment in _maybeHandleContactSyncMessage — this
+    // reply used to fire unconditionally for every original sync-check
+    // heard, which is exactly what produced the observed spam: a channel
+    // has several participants, so each of THEIR original checks (plus any
+    // the mesh itself retransmits) used to each cost this device its own
+    // immediate, un-cooled-down reply transmission. Sharing the cooldown
+    // key with the prompted/periodic channel checks closes that gap.
+    if (!payload.isReply &&
+        pad != null &&
+        _shouldSendPromptSyncCheck('s:$channelIndex')) {
       final reply = OtpSyncService.buildShared(
         isReply: true,
         offset: pad.offset,
@@ -1631,10 +1651,20 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpAutoSyncPollTimer = null;
   }
 
+  // Skips a target while a real chunked send or receive is actually in
+  // flight for it (_pendingContactChunkSends/_pendingChannelChunkSends,
+  // _contactChunkReassembly/_channelChunkReassembly) — never let this
+  // device's own diagnostic probe compete with real message chunk/ack
+  // traffic for airtime; that's exactly when reliable delivery matters
+  // most, and is exactly the contention real hardware showed tripping the
+  // firmware's "too fast" rate limit.
   void _pollActiveOtpSyncCheck() {
     final contactKeyHex = _activeContactKey;
     if (contactKeyHex != null &&
         !_contactSyncBackoff.contains(contactKeyHex) &&
+        !_pendingContactChunkSends.containsKey(contactKeyHex) &&
+        (_contactChunkReassembly[contactKeyHex]?.isNotEmpty ?? false) ==
+            false &&
         getContactOtpPad(contactKeyHex)?.enabled == true) {
       checkContactPadSync(contactKeyHex);
       _armSyncBackoffTimer(
@@ -1645,6 +1675,9 @@ class MeshCoreConnector extends ChangeNotifier {
     final channelIndex = _activeChannelIndex;
     if (channelIndex != null &&
         !_channelSyncBackoff.contains(channelIndex) &&
+        !_pendingChannelChunkSends.containsKey(channelIndex) &&
+        (_channelChunkReassembly[channelIndex]?.isNotEmpty ?? false) ==
+            false &&
         getChannelOtpPad(channelIndex)?.enabled == true) {
       checkChannelPadSync(channelIndex);
       _armSyncBackoffTimer(
@@ -1685,7 +1718,13 @@ class MeshCoreConnector extends ChangeNotifier {
   // sent, without adding a manual "did I already check recently"
   // condition at every call site.
   final Map<String, DateTime> _lastPromptSyncCheckAt = {};
-  static const Duration _promptSyncCheckCooldown = Duration(seconds: 5);
+  // Widened from 5s to 10s (matching the Lua side's SYNC_PROMPT_MIN_
+  // SPACING_MS) now that this cooldown also gates reply-echo transmissions
+  // (see _maybeHandleContactSyncMessage/_maybeHandleChannelSyncMessage) —
+  // real hardware evidence showed 5s wasn't enough margin against the
+  // firmware's "too fast" rate limit when a reply lands close to a real
+  // message chunk/ack.
+  static const Duration _promptSyncCheckCooldown = Duration(seconds: 10);
 
   bool _shouldSendPromptSyncCheck(String cooldownKey) {
     final last = _lastPromptSyncCheckAt[cooldownKey];
