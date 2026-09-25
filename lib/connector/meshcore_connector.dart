@@ -1256,7 +1256,8 @@ class MeshCoreConnector extends ChangeNotifier {
   // offsets haven't drifted apart, without spending any pad. See
   // otp_sync_service.dart for the wire format and the receive-path hooks in
   // _parseContactMessage/_handleIncomingChannelMessage/_handleLogRxData for
-  // where OTPSYNC1| messages are intercepted before OTP dispatch.
+  // where sync-check messages (marker "z1", see otp_sync_service.dart) are
+  // intercepted before OTP dispatch.
 
   OtpSyncStatus? getContactOtpSyncStatus(String contactKeyHex) =>
       _contactOtpSyncStatus[contactKeyHex];
@@ -1346,7 +1347,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpSyncTimeoutTimers[key] = Timer(_otpSyncTimeout, onTimeout);
   }
 
-  /// Returns true if [text] was an `OTPSYNC1|` control message (handled
+  /// Returns true if [text] was a sync-check control message (handled
   /// here, including sending the automatic reply) and must NOT be shown as
   /// a chat message — mirrors how a chunk piece/ack "handled" result
   /// suppresses display in [_dispatchOtpContact].
