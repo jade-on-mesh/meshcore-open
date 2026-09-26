@@ -36,13 +36,23 @@ import '../services/linux_ble_pairing_service_stub.dart'
 import '../services/image_chunk_transport.dart'
     show
         ImageChunkOutcome,
+        ImageChunkStatus,
         ImageChunkTransport,
+        ImageReassemblyResult,
+        ImageStreamKey,
+        ImageStreamMetadata,
         buildSendChannelDataFrame,
         dataTypeAeicImage,
         outPathUnknown,
         respCodeChannelDataRecv,
         senderPrefixFromKey;
 import '../services/image_codec_service.dart';
+import '../services/otp_image_transport.dart';
+import '../services/received_image_store.dart'
+    show ReceivedImageEntry, ReceivedImageRef, ReceivedImageStore;
+import '../widgets/image_send_codec_binding.dart'
+    show ImageCodecRatePoint, kImageCodecSquareSize;
+import '../models/image_codec_support.dart' show aeicRatePointForUi;
 import '../services/message_retry_service.dart';
 import '../services/path_history_service.dart';
 import '../services/app_settings_service.dart';
@@ -279,6 +289,22 @@ class MeshCoreConnector extends ChangeNotifier {
   ImageChunkTransport? _imageTransport;
   void Function(ImageChunkOutcome outcome)? _onImageChunk;
   void Function(int senderPrefix)? _onImageSenderPrefix;
+  // OTP-encrypted DM image transfer (see otp_image_transport.dart) reuses
+  // this same store for its receive-side state/decode-queue/eviction —
+  // injected here exactly like _imageCodecService/_imageTransport above,
+  // rather than duplicating any of that machinery for the DM path.
+  ReceivedImageStore? _receivedImageStore;
+
+  /// Arbitrary, fixed `senderPrefix` values used only to keep
+  /// [ReceivedImageStore]'s `(senderPrefix, imgId, channelIndex)` key space
+  /// from colliding an incoming OTP DM image with an outgoing one that
+  /// happens to reuse the same chunk-transfer id (`imgId`) on the same
+  /// contact's virtual channel index. A DM has only two parties and each
+  /// direction is always tagged consistently, so — unlike a real channel,
+  /// where senderPrefix disambiguates N different senders — these never
+  /// need to identify a real device.
+  static const int _otpDmIncomingSenderPrefix = 1;
+  static const int _otpDmOutgoingSenderPrefix = 2;
   // Intentionally global (not per-contact): tracks overall network activity.
   // Frequent RX from any source indicates a busy network with more collisions.
   DateTime _lastRxTime = DateTime.now();
@@ -2371,7 +2397,90 @@ class MeshCoreConnector extends ChangeNotifier {
     final joined = state.tryJoin();
     if (joined == null) return null;
     perContact.remove(frame.tid);
+
+    // An OTP-encrypted image transfer (see otp_image_transport.dart) rides
+    // over this exact chunk pipeline, so the only way to tell it apart from
+    // ordinary chat text is to check the reassembled PLAINTEXT for its
+    // marker before ever calling utf8.decode on it — the marker check must
+    // come first because `allowMalformed: true` below would otherwise
+    // silently mangle the binary bitstream into lossy replacement
+    // characters, destroying it. This can't return synchronously through
+    // `_dispatchOtpContact`'s displayText plumbing like ordinary chunked
+    // text does: registering the image (and its preview bytes) with
+    // ReceivedImageStore is async, so it's finished separately and posts
+    // its own message once done (see _completeIncomingContactImage) —
+    // nothing is shown for this frame in the meantime, exactly like a
+    // non-final chunk.
+    final imagePayload = OtpImageTransport.parse(joined);
+    if (imagePayload != null) {
+      unawaited(_completeIncomingContactImage(contact, imagePayload, frame.tid));
+      return null;
+    }
+
     return utf8.decode(joined, allowMalformed: true);
+  }
+
+  /// Finishes an OTP DM image transfer once every chunk has reassembled and
+  /// [OtpImageTransport.parse] has confirmed the marker: hands the bitstream
+  /// to [ReceivedImageStore] exactly as an inbound channel image would (see
+  /// `ImageStreamReassembler.addChunk` in main.dart), then posts the
+  /// sentinel message itself.
+  ///
+  /// Best-effort throughout: by the time this runs, the transfer has already
+  /// been fully received and acked, so a failure here (no store wired, a
+  /// disk-write error) must not look like a lost message — it's logged and
+  /// dropped rather than surfaced as a decrypt error.
+  Future<void> _completeIncomingContactImage(
+    Contact contact,
+    OtpImagePayload payload,
+    int tid,
+  ) async {
+    final store = _receivedImageStore;
+    if (store == null) {
+      appLogger.warn(
+        'OTP image from ${contact.publicKeyHex} dropped: no '
+        'ReceivedImageStore wired into this build',
+      );
+      return;
+    }
+    final channelIndex = OtpImageTransport.virtualChannelIndexFor(
+      contact.publicKeyHex,
+    );
+    final outcome = ImageChunkOutcome(
+      ImageChunkStatus.completed,
+      result: ImageReassemblyResult(
+        key: ImageStreamKey(
+          senderPrefix: _otpDmIncomingSenderPrefix,
+          imgId: tid,
+          channelIndex: channelIndex,
+        ),
+        metadata: payload.metadata,
+        data: payload.bitstream,
+        recoveredWithParity: false,
+        chunkCount: 1,
+      ),
+    );
+    ReceivedImageEntry? entry;
+    try {
+      entry = await store.handleOutcome(outcome, channelIndex: channelIndex);
+    } on Exception catch (error) {
+      appLogger.warn(
+        'OTP image from ${contact.publicKeyHex} failed to register: $error',
+      );
+      return;
+    }
+    if (entry == null) return;
+    final message = Message(
+      senderKey: contact.publicKey,
+      text: ReceivedImageRef.encode(entry.streamId),
+      timestamp: DateTime.now(),
+      isOutgoing: false,
+      isCli: false,
+      status: MessageStatus.delivered,
+      pathBytes: Uint8List(0),
+    );
+    _addMessage(contact.publicKeyHex, message);
+    notifyListeners();
   }
 
   /// Same idea for a channel-received chunk. Per the wire format, the ack
@@ -2537,6 +2646,132 @@ class MeshCoreConnector extends ChangeNotifier {
     await _sendCurrentContactChunk(state);
   }
 
+  /// True when this contact has an OTP pad configured and no chunked send
+  /// (text or image) already in flight — the gate a "send photo" button
+  /// should use to decide whether to show/enable itself.
+  bool canSendOtpImageToContact(String contactKeyHex) {
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null || !pad.enabled) return false;
+    return !_pendingContactChunkSends.containsKey(contactKeyHex);
+  }
+
+  /// Sends [codecBitstream] (the output of `ImageCodecService.encodeImageFile`
+  /// — see `image_send_preview_sheet.dart`) as an OTP-encrypted DM to
+  /// [contact], riding over the same chunked-send pipeline an ordinary long
+  /// OTP text message uses (see `_sendChunkedContactMessage` above) rather
+  /// than the channel-only GRP_DATA image transport.
+  ///
+  /// [previewPng] is the sender's own 512x512 crop (not a decode) — exactly
+  /// what the channel image feature shows for the sender's own bubble — so
+  /// this contact's own sent photo renders immediately without waiting on a
+  /// round trip or a model decode. Returns false without sending anything
+  /// if there's no usable OTP pad for this contact, a chunked send to them
+  /// is already in flight, or the image is too large even chunked.
+  Future<bool> sendOtpImageToContact(
+    Contact contact, {
+    required Uint8List codecBitstream,
+    required Uint8List previewPng,
+    required ImageCodecRatePoint rate,
+    int aspectCode = 0,
+    int resolution = kImageCodecSquareSize,
+  }) async {
+    if (!canSendOtpImageToContact(contact.publicKeyHex)) return false;
+    final metadata = ImageStreamMetadata(
+      rate: rate,
+      squareSize: resolution,
+      aspectCode: aspectCode,
+    );
+    Uint8List plaintext;
+    try {
+      plaintext = OtpImageTransport.buildPlaintext(
+        metadata: metadata,
+        bitstream: codecBitstream,
+      );
+    } on ArgumentError catch (e) {
+      appLogger.warn('sendOtpImage: unrepresentable resolution: $e');
+      return false;
+    }
+    return _sendChunkedContactImage(
+      contact,
+      plaintext,
+      metadata: metadata,
+      previewPng: previewPng,
+    );
+  }
+
+  Future<bool> _sendChunkedContactImage(
+    Contact contact,
+    Uint8List plainBytes, {
+    required ImageStreamMetadata metadata,
+    required Uint8List previewPng,
+  }) async {
+    final capacity =
+        OtpService.maxPlaintextBytesForContact() - OtpChunkService.chunkOverheadBytes;
+    if (capacity <= 0) {
+      appLogger.warn('sendOtpImage: no room for chunk framing overhead on this contact');
+      return false;
+    }
+    final dataChunks = OtpChunkService.splitPlaintextBytes(plainBytes, capacity);
+    if (dataChunks.length > 255) {
+      appLogger.warn(
+        'sendOtpImage: image too large even for chunking '
+        '(${dataChunks.length} chunks needed)',
+      );
+      return false;
+    }
+
+    // Placeholder bubble text until the transfer completes and
+    // onSendCompleted swaps it for the real ReceivedImageRef sentinel — the
+    // chunk progress machinery (chunkIndex/chunkTotal) already renders
+    // "n/m" over whatever text is here in the meantime, exactly like a long
+    // chunked text message.
+    final message = Message.outgoing(
+      contact.publicKey,
+      '📷 Photo',
+      chunkIndex: 0,
+      chunkTotal: dataChunks.length,
+    );
+    _addMessage(contact.publicKeyHex, message);
+    notifyListeners();
+
+    final tid = math.Random.secure().nextInt(256);
+    final state = _OtpContactChunkSend(
+      contact: contact,
+      tid: tid,
+      chunks: dataChunks,
+      localMessageId: message.messageId,
+    );
+    state.onSendCompleted = (success) async {
+      if (!success) return;
+      final store = _receivedImageStore;
+      if (store == null) return;
+      final channelIndex = OtpImageTransport.virtualChannelIndexFor(
+        contact.publicKeyHex,
+      );
+      try {
+        final entry = await store.registerOutgoing(
+          channelIndex: channelIndex,
+          senderPrefix: _otpDmOutgoingSenderPrefix,
+          imgId: tid,
+          previewPng: previewPng,
+          rate: aeicRatePointForUi(metadata.rate),
+          chunkCount: dataChunks.length,
+        );
+        _updateStoredContactMessage(
+          contact.publicKeyHex,
+          message.messageId,
+          (m) => m.copyWith(text: ReceivedImageRef.encode(entry.streamId)),
+        );
+        notifyListeners();
+      } on Exception catch (error) {
+        appLogger.warn('outgoing OTP image registration failed: $error');
+      }
+    };
+    _pendingContactChunkSends[contact.publicKeyHex] = state;
+    await _sendCurrentContactChunk(state);
+    return true;
+  }
+
   Future<void> _sendCurrentContactChunk(_OtpContactChunkSend state) async {
     if (_pendingContactChunkSends[state.contact.publicKeyHex] != state) return;
     if (state.sctr >= state.chunks.length) {
@@ -2658,6 +2893,10 @@ class MeshCoreConnector extends ChangeNotifier {
     );
     if (success) {
       _requestPromptContactSyncCheck(state.contact.publicKeyHex);
+    }
+    final onCompleted = state.onSendCompleted;
+    if (onCompleted != null) {
+      unawaited(onCompleted(success));
     }
   }
 
@@ -3129,6 +3368,7 @@ class MeshCoreConnector extends ChangeNotifier {
     ImageChunkTransport? imageTransport,
     void Function(ImageChunkOutcome outcome)? onImageChunk,
     void Function(int senderPrefix)? onImageSenderPrefix,
+    ReceivedImageStore? receivedImageStore,
   }) {
     _retryService = retryService;
     _pathHistoryService = pathHistoryService;
@@ -3138,6 +3378,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _imageTransport = imageTransport;
     _onImageChunk = onImageChunk;
     _onImageSenderPrefix = onImageSenderPrefix;
+    _receivedImageStore = receivedImageStore;
     _bleDebugLogService = bleDebugLogService;
     _appDebugLogService = appDebugLogService;
     _backgroundService = backgroundService;
@@ -10257,6 +10498,15 @@ abstract class _OtpChunkSend {
 
 class _OtpContactChunkSend extends _OtpChunkSend {
   final Contact contact;
+
+  /// Fires exactly once, when this whole chunked transfer finishes
+  /// (success or not). An ordinary chunked text message has nothing left
+  /// to do once `_finishContactChunkSend` has updated its status, so this
+  /// is null for one — only an OTP DM image send sets it, to register the
+  /// completed transfer with `ReceivedImageStore` and swap the placeholder
+  /// bubble text for the real image sentinel, which can only happen once
+  /// transmission is confirmed (see `_sendChunkedContactImage`).
+  Future<void> Function(bool success)? onSendCompleted;
 
   _OtpContactChunkSend({
     required this.contact,

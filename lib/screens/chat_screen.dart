@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
 
 import '../utils/app_logger.dart';
@@ -23,25 +26,33 @@ import '../helpers/gif_helper.dart';
 import '../models/channel_message.dart';
 import '../models/contact.dart';
 import '../l10n/contact_localization.dart';
+import '../models/image_codec_support.dart' show aeicRatePointForUi;
 import '../models/message.dart';
 import '../models/translation_support.dart';
 import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
+import '../services/image_chunk_transport.dart';
+import '../services/image_codec_service.dart';
 import '../services/otp_chunk_service.dart';
 import '../services/otp_service.dart';
 import '../services/path_history_service.dart';
+import '../services/received_image_store.dart';
 import '../services/translation_service.dart';
 import '../theme/mesh_theme.dart';
 import '../widgets/chat_zoom_wrapper.dart';
 import '../widgets/byte_count_input.dart';
+import 'app_settings_screen.dart';
 import 'channel_message_path_screen.dart';
 import 'map_screen.dart';
 import 'otp_pad_screen.dart';
 import '../widgets/emoji_picker.dart';
 import '../widgets/gif_message.dart';
+import '../widgets/image_send_codec_binding.dart';
+import '../widgets/image_send_preview_sheet.dart';
 import '../widgets/jump_to_bottom_button.dart';
 import '../widgets/gif_picker.dart';
 import '../widgets/message_translation_button.dart';
+import '../widgets/received_image_message.dart';
 import '../widgets/routing_sheet.dart';
 import '../widgets/radio_stats_entry.dart';
 import '../widgets/signal_grade_indicator.dart';
@@ -54,13 +65,18 @@ import '../theme/mesh_theme.dart';
 import '../widgets/mesh_ui.dart';
 import 'telemetry_screen.dart';
 
-// Image messages are deliberately absent from this screen, and there is no
-// flag to flip: the AEIC wire format is `CMD_SEND_CHANNEL_DATA` (62) /
-// GRP_DATA 0x06, which addresses a channel index rather than a contact key,
-// and the companion protocol has no direct-message equivalent (there is no
-// CMD_SEND_DATA — see `meshcore_protocol.dart`). Sending a private photo on
-// channel 0 to reach one contact would broadcast it to everyone on that
-// channel. Channel chats keep the feature; see `channel_chat_screen.dart`.
+// Image messages here do NOT use the channel image feature's wire format:
+// AEIC-over-GRP_DATA (`CMD_SEND_CHANNEL_DATA` 62 / GRP_DATA 0x06) addresses a
+// channel index, not a contact key, and the companion protocol has no
+// direct-message equivalent for it (there is no CMD_SEND_DATA — see
+// `meshcore_protocol.dart`); sending a private photo on channel 0 to reach
+// one contact would broadcast it to everyone on that channel. Instead, an
+// OTP-enabled DM sends the same neural-codec bitstream (see
+// `image_codec_service.dart`) OTP-encrypted, chunked over the ordinary OTP
+// DM text-chunk pipeline (`otp_image_transport.dart` /
+// `MeshCoreConnector.sendOtpImageToContact`) — never over GRP_DATA — so it is
+// only available when OTP is enabled for this contact, unlike the channel
+// feature.
 
 class ChatScreen extends StatefulWidget {
   final Contact contact;
@@ -86,6 +102,10 @@ class _ChatScreenState extends State<ChatScreen> {
   Message? _pendingUnreadScrollTarget;
   String? _unreadDividerMessageId;
   DateTime? _lastTextSendAt;
+  // OTP DM image send progress — mirrors channel_chat_screen.dart's own
+  // _imageSendTotal/_imageSendSent, but this is chunk progress from the OTP
+  // chunk-ack pipeline, not GRP_DATA blob-send progress.
+  bool _sendingOtpImage = false;
 
   @override
   void initState() {
@@ -566,9 +586,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildInputBar(MeshCoreConnector connector) {
-    final maxBytes = connector.isContactOtpEnabled(
-      _resolveContact(connector).publicKeyHex,
-    )
+    final contactKeyHex = _resolveContact(connector).publicKeyHex;
+    final otpEnabled = connector.isContactOtpEnabled(contactKeyHex);
+    final maxBytes = otpEnabled
         // Longer OTP messages now get automatically split into multiple
         // packets (see otp_chunk_service.dart), so the compose-box limit is
         // the much larger multi-chunk cap, not the single-packet one.
@@ -576,6 +596,11 @@ class _ChatScreenState extends State<ChatScreen> {
         : maxContactMessageBytes();
     final scheme = Theme.of(context).colorScheme;
     final settings = context.watch<AppSettingsService>().settings;
+    // Only ever offered on an OTP-enabled DM: the codec bitstream rides the
+    // OTP chunk-send pipeline (see the note at the top of this file), which
+    // has nothing to encrypt with otherwise.
+    final showImageAction =
+        otpEnabled && !_sendingOtpImage && connector.canSendOtpImageToContact(contactKeyHex);
     return Container(
       decoration: BoxDecoration(
         color: scheme.surface,
@@ -593,7 +618,14 @@ class _ChatScreenState extends State<ChatScreen> {
                 offset: const Offset(0, -64),
                 tooltip: context.l10n.chat_selectSendAction,
                 onSelected: (action) {
-                  if (action == 'gif') _showGifPicker(context);
+                  switch (action) {
+                    case 'gif':
+                      _showGifPicker(context);
+                      break;
+                    case 'otp-image':
+                      _showOtpImageSendPreview(connector);
+                      break;
+                  }
                 },
                 itemBuilder: (context) => [
                   PopupMenuItem(
@@ -606,6 +638,24 @@ class _ChatScreenState extends State<ChatScreen> {
                       ],
                     ),
                   ),
+                  if (showImageAction)
+                    PopupMenuItem(
+                      value: 'otp-image',
+                      // Gated on the codec, not just OTP being enabled: the
+                      // preview sheet explains why a send is impossible, but
+                      // a fully live button in a build that cannot encode
+                      // invites the tap that produces that explanation.
+                      enabled:
+                          _imageCodec?.availability ==
+                          ImageCodecAvailability.ready,
+                      child: Row(
+                        children: [
+                          const Icon(Icons.image_outlined),
+                          const SizedBox(width: 12),
+                          Text(context.l10n.chat_sendImageLora),
+                        ],
+                      ),
+                    ),
                 ],
               ),
               if (settings.translationEnabled)
@@ -759,6 +809,190 @@ class _ChatScreenState extends State<ChatScreen> {
         },
       ),
     );
+  }
+
+  /// The image codec, or null when it is not registered (screen tests).
+  ImageCodecService? get _imageCodec {
+    try {
+      return context.read<ImageCodecService>();
+    } on ProviderNotFoundException {
+      return null;
+    }
+  }
+
+  /// Picks a photo, encodes it with the neural codec, and (if the user
+  /// confirms the preview) OTP-encrypts and chunk-sends it to this contact —
+  /// the DM equivalent of `channel_chat_screen.dart`'s
+  /// `_showImageSendPreview`, but riding the OTP DM chunk pipeline instead
+  /// of GRP_DATA (see the note at the top of this file and
+  /// `otp_image_transport.dart`).
+  Future<void> _showOtpImageSendPreview(MeshCoreConnector connector) async {
+    final codec = _imageCodec;
+    if (codec == null) return;
+    final contact = _resolveContact(connector);
+
+    // The picked bytes are kept past the preview on purpose: the sender's
+    // own bubble renders from them (see [_sendOtpImage]), not from a decode
+    // of the bitstream, which would cost ~2.16 GiB and ~1 s to reproduce an
+    // image this device is already holding.
+    final XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        // The codec centre-crops to 512x512 anyway, so there is nothing to
+        // gain from decoding a 12 MP original — but stay well above 512 so
+        // the crop still has detail to work with.
+        maxWidth: 2048,
+        maxHeight: 2048,
+      );
+    } on Exception catch (e) {
+      debugPrint('image pick failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(context.l10n.chat_imagePickFailed)),
+      );
+      return;
+    }
+    if (picked == null) return; // cancelled at the picker
+
+    final Uint8List sourceBytes;
+    final int originalFileBytes;
+    try {
+      sourceBytes = await picked.readAsBytes();
+      originalFileBytes = await picked.length();
+    } on Exception catch (e) {
+      debugPrint('image read failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(context.l10n.chat_imagePickFailed)),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    final result = await showImageSendPreviewSheet(
+      context: context,
+      imageBytes: sourceBytes,
+      originalFileBytes: originalFileBytes,
+      codec: codec,
+      // A DM image never carries an XOR parity chunk: the OTP chunk pipeline
+      // already has its own per-chunk ack/retry, so a lost chunk is simply
+      // retried, not reconstructed from parity. The sheet's parity toggle is
+      // otherwise meaningless here (irrelevant, since sendOtpImageToContact
+      // ignores includeParity below).
+      initialParity: false,
+    );
+    if (result == null) return; // cancelled at the preview
+    if (!mounted) return;
+    await _sendOtpImage(connector, contact, result, sourceBytes: sourceBytes);
+  }
+
+  /// Sends the already-encoded [result] to [contact] over the OTP DM chunk
+  /// pipeline.
+  ///
+  /// NOTE: the preview sheet's packet-count/airtime estimate reflects the
+  /// channel GRP_DATA chunk geometry (`kImageChunkBlobBytes`), not this
+  /// pipeline's actual per-chunk capacity — a known, documented cosmetic gap
+  /// (see the project doc) rather than a functional one: the real chunking
+  /// below (`OtpChunkService.splitPlaintextBytes`) is unaffected by whatever
+  /// number the sheet showed.
+  Future<void> _sendOtpImage(
+    MeshCoreConnector connector,
+    Contact contact,
+    ImageSendPreviewResult result, {
+    required Uint8List sourceBytes,
+  }) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final l10n = context.l10n;
+
+    setState(() => _sendingOtpImage = true);
+    try {
+      final previewPng = await _squarePreviewPng(sourceBytes);
+      if (previewPng == null) {
+        messenger.showSnackBar(
+          SnackBar(content: Text(l10n.chat_imagePickFailed)),
+        );
+        return;
+      }
+      final aspectCode = await _aspectCodeOf(sourceBytes);
+      final sent = await connector.sendOtpImageToContact(
+        contact,
+        codecBitstream: result.payload,
+        previewPng: previewPng,
+        rate: result.rate,
+        aspectCode: aspectCode,
+      );
+      // No success snackbar: unlike the channel feature (where GRP_DATA
+      // sends nothing the sender's own transcript otherwise shows), this
+      // send immediately produces a real message bubble with its own
+      // chunk-progress display — exactly like an ordinary chunked OTP text
+      // message — so a second "sent" confirmation would be redundant.
+      if (!sent && mounted) {
+        messenger.showSnackBar(
+          SnackBar(content: Text(l10n.imageSend_deviceUnsupported)),
+        );
+      }
+    } on Exception catch (error) {
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text(l10n.imageSend_sendFailed('$error'))),
+      );
+    } finally {
+      if (mounted) setState(() => _sendingOtpImage = false);
+    }
+  }
+
+  /// The [kImageAspectCodes] entry matching [imageBytes]'s shape. Mirrors
+  /// `channel_chat_screen.dart`'s helper of the same name.
+  static Future<int> _aspectCodeOf(Uint8List imageBytes) async {
+    ui.Image? image;
+    try {
+      final codec = await ui.instantiateImageCodec(imageBytes);
+      image = (await codec.getNextFrame()).image;
+      return imageAspectCodeFor(image.width, image.height);
+    } on Exception catch (error) {
+      debugPrint('aspect probe failed: $error');
+      return kImageAspectUnknown;
+    } finally {
+      image?.dispose();
+    }
+  }
+
+  /// [imageBytes] stretched to 512x512, as PNG — what the codec actually
+  /// encoded, so the sender's own bubble matches what the receiver sees.
+  /// Mirrors `channel_chat_screen.dart`'s helper of the same name.
+  static Future<Uint8List?> _squarePreviewPng(Uint8List imageBytes) async {
+    ui.Image? source;
+    ui.Image? square;
+    try {
+      final codec = await ui.instantiateImageCodec(imageBytes);
+      source = (await codec.getNextFrame()).image;
+      final dst = kImageCodecSquareSize.toDouble();
+      final recorder = ui.PictureRecorder();
+      ui.Canvas(recorder).drawImageRect(
+        source,
+        ui.Rect.fromLTWH(
+          0,
+          0,
+          source.width.toDouble(),
+          source.height.toDouble(),
+        ),
+        ui.Rect.fromLTWH(0, 0, dst, dst),
+        ui.Paint()..filterQuality = ui.FilterQuality.medium,
+      );
+      square = await recorder.endRecording().toImage(
+        kImageCodecSquareSize,
+        kImageCodecSquareSize,
+      );
+      final data = await square.toByteData(format: ui.ImageByteFormat.png);
+      return data?.buffer.asUint8List();
+    } on Exception catch (error) {
+      debugPrint('outgoing image preview render failed: $error');
+      return null;
+    } finally {
+      source?.dispose();
+      square?.dispose();
+    }
   }
 
   Future<void> _showTranslationOptions() async {
@@ -1493,6 +1727,15 @@ class _MessageBubble extends StatelessWidget {
     final isOutgoing = message.isOutgoing;
     final scheme = Theme.of(context).colorScheme;
     final gifId = GifHelper.parseGif(message.text);
+    // An OTP DM image (see otp_image_transport.dart) posts its message with
+    // this exact sentinel in `text` — the same "carry an id, not the
+    // pixels" trick the channel image feature uses (ReceivedImageRef) — so
+    // ReceivedImageStore, not this bubble, owns the actual bytes/state.
+    final otpImageStreamId = ReceivedImageRef.parse(message.text);
+    // Both a GIF and an OTP image bubble draw their own chrome (the
+    // renderer widget fills the whole bubble), so both want the same
+    // tighter, image-style padding the plain-text bubble below does not.
+    final compactChrome = gifId != null || otpImageStreamId != null;
     final poi = parseMarkerText(message.text);
     final isFailed = message.status == MessageStatus.failed;
     final urlImagesEnabled = context.select<MeshCoreConnector, bool>(
@@ -1597,7 +1840,7 @@ class _MessageBubble extends StatelessWidget {
                   ],
                   Flexible(
                     child: Container(
-                      padding: gifId != null
+                      padding: compactChrome
                           ? const EdgeInsets.all(4)
                           : const EdgeInsets.symmetric(
                               horizontal: 12,
@@ -1616,7 +1859,7 @@ class _MessageBubble extends StatelessWidget {
                         children: [
                           if (!isOutgoing) ...[
                             Padding(
-                              padding: gifId != null
+                              padding: compactChrome
                                   ? const EdgeInsets.only(
                                       left: 8,
                                       top: 4,
@@ -1632,7 +1875,7 @@ class _MessageBubble extends StatelessWidget {
                                 ),
                               ),
                             ),
-                            if (gifId == null) const SizedBox(height: 2),
+                            if (!compactChrome) const SizedBox(height: 2),
                           ],
                           if (poi != null)
                             _buildPoiMessage(
@@ -1658,6 +1901,22 @@ class _MessageBubble extends StatelessWidget {
                                   ),
                                 ),
                               ],
+                            )
+                          else if (otpImageStreamId != null)
+                            ReceivedImageMessage(
+                              streamId: otpImageStreamId,
+                              isOutgoing: isOutgoing,
+                              fallbackTextColor: textColor,
+                              strings: _receivedImageStrings(context),
+                              onOpenCodecSettings: () => Navigator.of(
+                                context,
+                              ).push(
+                                MaterialPageRoute<void>(
+                                  builder: (_) => const AppSettingsScreen(
+                                    focusImageMessages: true,
+                                  ),
+                                ),
+                              ),
                             )
                           else if (urlImagesEnabled)
                             MessageUrlImageFutureBuilder(
@@ -1736,7 +1995,7 @@ class _MessageBubble extends StatelessWidget {
                               message.retryCount > 0) ...[
                             const SizedBox(height: 3),
                             Padding(
-                              padding: gifId != null
+                              padding: compactChrome
                                   ? const EdgeInsets.symmetric(horizontal: 8)
                                   : EdgeInsets.zero,
                               child: Text(
@@ -1757,7 +2016,7 @@ class _MessageBubble extends StatelessWidget {
                           const SizedBox(height: 3),
                           // Meta row: timestamp + status icon + optional tracing
                           Padding(
-                            padding: gifId != null
+                            padding: compactChrome
                                 ? const EdgeInsets.only(
                                     left: 8,
                                     right: 8,
@@ -2056,4 +2315,26 @@ Color _colorForName(String name) {
     h = (h * 31 + c) & 0x7fffffff;
   }
   return hues[h % hues.length];
+}
+
+/// Mirrors `channel_chat_screen.dart`'s private helper of the same name —
+/// duplicated rather than shared, matching this codebase's existing
+/// per-screen-helper convention.
+ReceivedImageStrings _receivedImageStrings(BuildContext context) {
+  final l10n = context.l10n;
+  return ReceivedImageStrings(
+    incoming: l10n.receivedImage_incoming,
+    queued: l10n.receivedImage_queued,
+    tapToDecode: l10n.receivedImage_tapToDecode,
+    awaiting: l10n.receivedImage_awaiting,
+    tapToProcess: l10n.receivedImage_tapToProcess,
+    decoding: l10n.receivedImage_decoding,
+    incomplete: l10n.receivedImage_incomplete,
+    corrupt: l10n.receivedImage_corrupt,
+    decoderMissing: l10n.receivedImage_decoderMissing,
+    evicted: l10n.receivedImage_evicted,
+    retry: l10n.receivedImage_retry,
+    decodeAgain: l10n.receivedImage_decodeAgain,
+    openSettings: l10n.receivedImage_openSettings,
+  );
 }

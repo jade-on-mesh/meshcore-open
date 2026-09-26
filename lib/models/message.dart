@@ -102,6 +102,7 @@ class Message {
   String get senderKeyHex => pubKeyToHex(senderKey);
 
   Message copyWith({
+    String? text,
     MessageStatus? status,
     int? retryCount,
     int? estimatedTimeoutMs,
@@ -127,7 +128,7 @@ class Message {
   }) {
     return Message(
       senderKey: senderKey,
-      text: text,
+      text: text ?? this.text,
       timestamp: timestamp,
       isOutgoing: isOutgoing,
       isCli: isCli ?? this.isCli,
