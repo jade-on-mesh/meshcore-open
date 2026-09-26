@@ -414,6 +414,29 @@ class MeshCoreConnector extends ChangeNotifier {
   // at a time (mirrors Lua's single in-flight `psend`).
   final Map<String, _OtpContactChunkSend> _pendingContactChunkSends = {};
   final Map<int, _OtpChannelChunkSend> _pendingChannelChunkSends = {};
+  // Phase 2 channel-collision mitigation (cheap jitter delay, matching
+  // OTP_3_RC1.lua's `pending_channel_send`/`channel_jitter_tick` — see
+  // that file's comment for the full tradeoff discussion vs. a full
+  // reserve/commit handshake). A channel send with OTP enabled does not
+  // capture the pad offset or encrypt at the moment the user hits send;
+  // it waits a short random delay first (`_channelJitterDelay`), so a
+  // competing message that arrives during the wait gets to advance this
+  // channel's pad offset FIRST — see `_encryptForChannel`, which always
+  // reads the pad fresh at call time. This set blocks a second send to
+  // the same channel while one is still in that delay window (mirrors
+  // the `_pendingChannelChunkSends` guard above).
+  final Set<int> _pendingChannelJitterChannels = {};
+  static const Duration _channelJitterMin = Duration(milliseconds: 600);
+  static const Duration _channelJitterMax = Duration(milliseconds: 2200);
+  final _channelJitterRandom = math.Random();
+  // Deliberately generous rather than tied to an exact hop count (not
+  // knowable before an unseen competing message actually arrives) — see
+  // the Lua-side constant of the same name for the full reasoning.
+  Duration _channelJitterDelay() {
+    final spanMs = _channelJitterMax.inMilliseconds - _channelJitterMin.inMilliseconds;
+    return _channelJitterMin +
+        Duration(milliseconds: _channelJitterRandom.nextInt(spanMs + 1));
+  }
   // Inbound reassembly state, keyed by (contact-or-channel, tid) — unlike
   // Lua's single global `imt`, this app can have multiple contacts (and a
   // channel) each with their own in-flight inbound transfer concurrently.
@@ -5552,9 +5575,13 @@ class MeshCoreConnector extends ChangeNotifier {
     // in sendMessage() above. Doubly important here: a channel pad is
     // shared-sequential (one counter every participant must agree on), so
     // corrupting its order doesn't just break this device, it desyncs
-    // everyone on the channel.
+    // everyone on the channel. Also refused while a previous send to this
+    // channel is still in its jitter delay (see
+    // _pendingChannelJitterChannels above) — same reasoning, just an
+    // earlier point in the same send.
     if (isChannelOtpEnabled(channel.index) &&
-        _pendingChannelChunkSends.containsKey(channel.index)) {
+        (_pendingChannelChunkSends.containsKey(channel.index) ||
+            _pendingChannelJitterChannels.contains(channel.index))) {
       appLogger.warn(
         'sendChannelMessage: still sending the previous message to '
         'channel ${channel.index}, dropping this send',
@@ -5594,7 +5621,38 @@ class MeshCoreConnector extends ChangeNotifier {
     // ChannelMessage record keeps the bare, unwrapped ciphertext, same as
     // before this fix.
     int? claimedOffset;
+    // Set below only for the OTP-enabled jitter path, once the bubble has
+    // already been added to _channelMessages as "pending" — lets the code
+    // after the delay fill in the real ciphertext on that SAME message
+    // (by messageId) instead of adding a second one.
+    ChannelMessage? jitterMessage;
     if (isChannelOtpEnabled(channel.index)) {
+      // Phase 2 channel-collision mitigation: show the bubble right away,
+      // holding only the plaintext (via otpPlaintext/displayText — see
+      // ChannelMessage), but don't touch the pad or encrypt yet. Wait a
+      // short random delay first, so a competing message from someone
+      // else that arrives in the meantime gets to advance this channel's
+      // pad offset before this device commits to one — see
+      // _encryptForChannel, which always reads the pad fresh at call
+      // time, and the class-level comment on _pendingChannelJitterChannels
+      // for the full tradeoff vs. a full reserve/commit handshake.
+      jitterMessage = ChannelMessage.outgoing(
+        '',
+        _selfName ?? 'Me',
+        channel.index,
+        originalText: originalText,
+        translatedLanguageCode: translatedLanguageCode,
+        translationModelId: translationModelId,
+        otpPlaintext: text,
+      );
+      _addChannelMessage(channel.index, jitterMessage);
+      notifyListeners();
+      _pendingChannelJitterChannels.add(channel.index);
+      try {
+        await Future.delayed(_channelJitterDelay());
+      } finally {
+        _pendingChannelJitterChannels.remove(channel.index);
+      }
       try {
         final encrypted = await _encryptForChannel(channel.index, text);
         wireText = encrypted.cipherHex;
@@ -5605,20 +5663,27 @@ class MeshCoreConnector extends ChangeNotifier {
           'sendChannelMessage: OTP pad exhausted for channel '
           '${channel.index}: $e',
         );
+        _markPendingChannelMessageFailedById(jitterMessage.messageId);
         return;
       }
     }
 
-    final message = ChannelMessage.outgoing(
-      wireText,
-      _selfName ?? 'Me',
-      channel.index,
-      originalText: originalText,
-      translatedLanguageCode: translatedLanguageCode,
-      translationModelId: translationModelId,
-      otpPlaintext: otpPlaintext,
-    );
-    _addChannelMessage(channel.index, message);
+    final message = jitterMessage != null
+        ? jitterMessage.copyWith(text: wireText)
+        : ChannelMessage.outgoing(
+            wireText,
+            _selfName ?? 'Me',
+            channel.index,
+            originalText: originalText,
+            translatedLanguageCode: translatedLanguageCode,
+            translationModelId: translationModelId,
+            otpPlaintext: otpPlaintext,
+          );
+    if (jitterMessage != null) {
+      _fillJitteredChannelMessageText(channel.index, message.messageId, wireText);
+    } else {
+      _addChannelMessage(channel.index, message);
+    }
     _pendingChannelSentQueue.add(message.messageId);
     notifyListeners();
 
@@ -8028,6 +8093,32 @@ class MeshCoreConnector extends ChangeNotifier {
       if (_markPendingChannelMessageSentById(queuedMessageId)) {
         return true;
       }
+    }
+    return false;
+  }
+
+  /// Fills in the real ciphertext (and any other passed fields) on a
+  /// channel message that was shown as a bubble before it was actually
+  /// encrypted — see the channel-send jitter delay in sendChannelMessage.
+  /// Unlike _markPendingChannelMessageSentById, this doesn't require the
+  /// message to still be `pending` (it always is at this point, but this
+  /// helper's job is narrower: just the text swap, not a status change).
+  bool _fillJitteredChannelMessageText(
+    int channelIndex,
+    String messageId,
+    String cipherHex,
+  ) {
+    final channelMessages = _channelMessages[channelIndex];
+    if (channelMessages == null) return false;
+    for (int i = channelMessages.length - 1; i >= 0; i--) {
+      final message = channelMessages[i];
+      if (message.messageId != messageId) continue;
+      channelMessages[i] = message.copyWith(text: cipherHex);
+      unawaited(
+        _channelMessageStore.saveChannelMessages(channelIndex, channelMessages),
+      );
+      notifyListeners();
+      return true;
     }
     return false;
   }

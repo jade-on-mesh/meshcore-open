@@ -106,8 +106,12 @@ class ChannelMessage {
   String get displayText => otpPlaintext ?? text;
 
   ChannelMessage copyWith({
-    // Only ever used to replace ciphertext with plaintext after an OTP
-    // decrypt — every other call site leaves this null and keeps `text`.
+    // Two call sites: replacing ciphertext with plaintext after an OTP
+    // decrypt (incoming), and filling in the real ciphertext on an
+    // outgoing message that was shown as a bubble before it was actually
+    // encrypted (see the channel-send jitter delay in
+    // meshcore_connector.dart's sendChannelMessage) — every other call
+    // site leaves this null and keeps `text`.
     String? text,
     ChannelMessageStatus? status,
     List<Repeat>? repeats,
@@ -267,6 +271,13 @@ class ChannelMessage {
     String? otpPlaintext,
     int? chunkIndex,
     int? chunkTotal,
+    // Explicit id for a message created BEFORE its final `text` is known
+    // (see OtpChannelJitterService's use of this) - the default id below
+    // is derived from `text`, which would silently give this message a
+    // different id once `text` is later filled in with real ciphertext,
+    // orphaning any queue entry or later copyWith lookup keyed on the
+    // original id.
+    String? messageId,
   }) {
     return ChannelMessage(
       senderKey: null,
@@ -283,6 +294,7 @@ class ChannelMessage {
       pathBytes: Uint8List(0),
       pathVariants: const [],
       channelIndex: channelIndex,
+      messageId: messageId,
       chunkIndex: chunkIndex,
       chunkTotal: chunkTotal,
     );
