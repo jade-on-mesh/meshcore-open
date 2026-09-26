@@ -64,6 +64,34 @@ class OtpDecryptException implements Exception {
 class OtpService {
   OtpService._();
 
+  /// Overall safety cap on how much pad this app will hold for one contact
+  /// or channel, matching Lua's `MAX_TOTAL_PAD_BYTES` (`OTP_3_RC1.lua`) —
+  /// raised from 1700 to 8200 bytes so a full-capacity pad can be imported
+  /// (via paste or file) in one operation rather than needing several
+  /// top-ups. This is a safety/UX guard, not a wire-format limit — nothing
+  /// stops two devices from agreeing on a bigger pad by other means, but
+  /// this app won't generate, import, or warn-free-ly hold more than this
+  /// per target.
+  static const int maxTotalPadBytes = 8200;
+
+  /// The largest pad this app will render as a single QR code, rather than
+  /// producing a code too dense to reliably encode or scan. A standard QR
+  /// symbol (version 40, the largest defined size) in alphanumeric mode at
+  /// error-correction level M holds 3391 characters — hex text uppercased
+  /// before encoding (see otp_pad_screen.dart's `_showPadQr`) qualifies for
+  /// alphanumeric mode (QR's alphanumeric charset is digits, uppercase
+  /// A-F, and a few symbols — exactly what uppercased hex is), roughly
+  /// doubling capacity versus the byte-mode encoding a mixed-case string
+  /// would force. 3391 characters is 1695 pad bytes; this is rounded down
+  /// to a slightly more conservative 1700 bytes both as headroom against
+  /// real-world scan reliability at that density (a version-40 symbol is
+  /// very fine-grained for a phone camera) and because it matches this
+  /// project's own pre-existing 1700-byte pad size from before the cap was
+  /// raised — a size already known to work as a single QR code in
+  /// practice. A pad larger than this should be shared by pasting the hex
+  /// or transferring the file directly instead of via QR.
+  static const int maxQrShareablePadBytes = 1700;
+
   /// Encrypts [plaintext] against [keyBytes] (a slice already carved out of
   /// the sender's pad, exactly [utf8.encode(plaintext).length] bytes long)
   /// and returns the bare lowercase-hex wire payload (no marker).

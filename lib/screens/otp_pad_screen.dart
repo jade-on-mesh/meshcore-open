@@ -69,6 +69,44 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       ? OtpService.maxPlaintextBytesForChannel(connector.selfName)
       : OtpService.maxPlaintextBytesForContact();
 
+  // The 4 sizes always offered, regardless of what's currently imported.
+  static const List<int> _fixedGenerateSizes = [
+    512,
+    OtpService.maxQrShareablePadBytes,
+    4096,
+    OtpService.maxTotalPadBytes,
+  ];
+
+  /// Dropdown items for the "Pad size" selector. Always includes the 4
+  /// fixed sizes; if `_generateBytes` was just set to match a pad someone
+  /// pasted or scanned in (see _importPad) and that size isn't one of the
+  /// 4 fixed ones, an extra item for it is appended so the dropdown can
+  /// actually display it — DropdownButtonFormField throws if its `value`
+  /// doesn't match exactly one item.
+  List<DropdownMenuItem<int>> _generateSizeItems() {
+    final items = [
+      const DropdownMenuItem(value: 512, child: Text('512 B')),
+      DropdownMenuItem(
+        value: OtpService.maxQrShareablePadBytes,
+        child: Text('${OtpService.maxQrShareablePadBytes} B (QR-safe)'),
+      ),
+      const DropdownMenuItem(value: 4096, child: Text('4 KB')),
+      DropdownMenuItem(
+        value: OtpService.maxTotalPadBytes,
+        child: Text('${OtpService.maxTotalPadBytes} B (max)'),
+      ),
+    ];
+    if (!_fixedGenerateSizes.contains(_generateBytes)) {
+      items.add(
+        DropdownMenuItem(
+          value: _generateBytes,
+          child: Text('$_generateBytes B (imported)'),
+        ),
+      );
+    }
+    return items;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -755,6 +793,16 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
                 children: [
                   Expanded(
                     child: DropdownButtonFormField<int>(
+                      // Keyed on the value itself: DropdownButtonFormField
+                      // only reads `initialValue` once, in its own
+                      // initState, so simply changing `_generateBytes` in a
+                      // later setState (see _importPad's auto-sync after a
+                      // paste/scan) would otherwise leave the dropdown
+                      // showing whatever was selected when it first built.
+                      // A key tied to the value forces Flutter to treat a
+                      // changed `_generateBytes` as a fresh widget instance
+                      // and actually pick up the new initialValue.
+                      key: ValueKey('generate-bytes-$_generateBytes'),
                       initialValue: _generateBytes,
                       decoration: InputDecoration(
                         labelText: 'Pad size',
@@ -763,12 +811,7 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
                         ),
                         isDense: true,
                       ),
-                      items: const [
-                        DropdownMenuItem(value: 512, child: Text('512 B')),
-                        DropdownMenuItem(value: 2048, child: Text('2 KB')),
-                        DropdownMenuItem(value: 8192, child: Text('8 KB')),
-                        DropdownMenuItem(value: 32768, child: Text('32 KB')),
-                      ],
+                      items: _generateSizeItems(),
                       onChanged: (value) {
                         if (value != null) {
                           setState(() => _generateBytes = value);
@@ -885,6 +928,16 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       setState(() => _formError = 'Pad is too short to be useful');
       return;
     }
+    final bytes = hex.length ~/ 2;
+    if (bytes > OtpService.maxTotalPadBytes) {
+      setState(
+        () => _formError =
+            'Pad is $bytes bytes - over the '
+            '${OtpService.maxTotalPadBytes} byte safety cap. Use a smaller '
+            'pad, or split it across separate contacts/channels.',
+      );
+      return;
+    }
     setState(() => _busy = true);
     final label = _labelController.text.trim();
     if (_isChannel) {
@@ -903,7 +956,18 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       );
     }
     if (!mounted) return;
-    setState(() => _busy = false);
+    setState(() {
+      _busy = false;
+      // Match the "Pad size" generator dropdown to whatever was just
+      // pasted/scanned in (e.g. importing an 8200-byte pad now shows
+      // "8200 B (max)" selected instead of staying on the 2048 B
+      // default), so a later top-up "Generate" for this same
+      // contact/channel defaults to the same size rather than requiring
+      // the person to notice and reselect it by hand. See
+      // _generateSizeItems for what happens when the imported size isn't
+      // one of the 4 fixed dropdown options.
+      _generateBytes = bytes;
+    });
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('OTP pad imported and enabled')),
     );
@@ -917,10 +981,49 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     }
   }
 
-  void _showPadQr(OtpPad pad) {
+  Future<void> _showPadQr(OtpPad pad) async {
+    final bytes = pad.padHex.length ~/ 2;
+    // A pad this large is very likely to produce a QR symbol too dense to
+    // scan reliably (see OtpService.maxQrShareablePadBytes for the actual
+    // capacity math) - ask before even trying, rather than silently
+    // rendering something the other device may not be able to read at all.
+    if (bytes > OtpService.maxQrShareablePadBytes && mounted) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Pad too large for one QR code'),
+          content: Text(
+            'This pad is $bytes bytes - larger than the '
+            '${OtpService.maxQrShareablePadBytes} bytes that reliably fit '
+            'in a single scannable QR code. It may render, but the other '
+            'device could fail to scan it. Paste the hex or transfer the '
+            'file directly instead for a pad this size.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Show anyway'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true || !mounted) return;
+    }
+    if (!mounted) return;
     QrCodeShareDialog.show(
       context: context,
-      data: pad.padHex,
+      // Uppercased so the QR encoder's alphanumeric mode applies (its
+      // charset is digits, uppercase A-F, and a few symbols - exactly
+      // uppercased hex) rather than the lower-capacity byte mode a
+      // mixed-case string would force. Purely a QR-density optimization -
+      // every import path already normalizes hex case-insensitively
+      // (_normalizeHex below lowercases on the way in), so this changes
+      // nothing about what gets stored or how it's decoded.
+      data: pad.padHex.toUpperCase(),
       title: 'Scan on the other device',
       instructions: pad.isSharedSequential
           ? 'This shows the raw pad in plain sight — make sure no one else '
