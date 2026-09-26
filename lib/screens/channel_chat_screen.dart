@@ -104,12 +104,25 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
   late DateFormat _hmFormat;
   late DateFormat _mdFormat;
 
+  // Participant sync strip (see _buildParticipantStrip): purely cosmetic
+  // periodic rebuild so a participant who's gone quiet actually drops out
+  // of the strip within a reasonable time of the 10-minute cutoff, rather
+  // than only whenever some unrelated event happens to call
+  // notifyListeners() next. No network activity, no pad bytes touched.
+  Timer? _participantStripPruneTimer;
+
   @override
   void initState() {
     super.initState();
     _textFieldFocusNode.addListener(_onTextFieldFocusChange);
     _scrollController.onScrollNearTop = _loadOlderMessages;
     _scrollController.showJumpToBottom.addListener(_clearDividerAtBottom);
+    _participantStripPruneTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) {
+        if (mounted) setState(() {});
+      },
+    );
     SchedulerBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final connector = context.read<MeshCoreConnector>();
@@ -203,6 +216,7 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
 
   @override
   void dispose() {
+    _participantStripPruneTimer?.cancel();
     _connector?.setActiveChannel(null);
     _scrollController.showJumpToBottom.removeListener(_clearDividerAtBottom);
     _textFieldFocusNode.removeListener(_onTextFieldFocusChange);
@@ -296,6 +310,73 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
             ),
           ),
       ],
+    );
+  }
+
+  // ── Participant sync strip ──────────────────────────────────────────
+  // Per-person request: show who's in this channel and whether their pad
+  // offset currently matches ours, right in the chat screen (not just the
+  // OTP Pad settings screen's all-time sync-status list). A name here is
+  // greyed out while its last-known status shows drift (still valid,
+  // heard from recently, just not caught up right now) and disappears
+  // entirely once nothing has been heard from them at all in the last 10
+  // minutes — likely means they've stepped away or gone out of range,
+  // not that they're still around but perpetually behind.
+  //
+  // Reuses the connector's existing per-channel-per-sender OtpSyncStatus
+  // tracking (originally built for the OTP Pad screen's "Check sync"
+  // card) rather than inventing separate state — this session also wired
+  // ordinary offset-bearing chat messages (not just explicit sync-check
+  // replies) into that same tracking, so the strip updates from normal
+  // conversation, not only after a manual/periodic sync-check.
+  static const Duration _participantStripMaxAge = Duration(minutes: 10);
+
+  Widget _buildParticipantStrip(MeshCoreConnector connector) {
+    if (!connector.isChannelOtpEnabled(widget.channel.index)) {
+      return const SizedBox.shrink();
+    }
+    final participants = connector.getActiveChannelParticipants(
+      widget.channel.index,
+      maxAge: _participantStripMaxAge,
+    );
+    if (participants.isEmpty) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final entries = participants.entries.toList()
+      ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
+    return SizedBox(
+      height: 36,
+      child: ListView.separated(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        scrollDirection: Axis.horizontal,
+        itemCount: entries.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 6),
+        itemBuilder: (context, i) {
+          final name = entries[i].key;
+          final synced = entries[i].value.inSync == true;
+          final color = synced ? MeshPalette.blue : scheme.onSurfaceVariant;
+          return Chip(
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            avatar: Icon(
+              synced ? Icons.check_circle : Icons.circle_outlined,
+              size: 14,
+              color: color,
+            ),
+            label: Text(
+              name,
+              style: TextStyle(
+                fontSize: 11,
+                color: synced ? null : scheme.onSurfaceVariant,
+              ),
+            ),
+            backgroundColor: synced
+                ? MeshPalette.blue.withValues(alpha: 0.12)
+                : scheme.surfaceContainerHighest,
+            side: BorderSide(color: color.withValues(alpha: 0.4)),
+          );
+        },
+      ),
     );
   }
 
@@ -416,6 +497,10 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
         top: false,
         child: Column(
           children: [
+            Consumer<MeshCoreConnector>(
+              builder: (context, connector, _) =>
+                  _buildParticipantStrip(connector),
+            ),
             Expanded(
               child: Consumer<MeshCoreConnector>(
                 builder: (context, connector, child) {

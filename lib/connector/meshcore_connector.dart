@@ -1293,6 +1293,32 @@ class MeshCoreConnector extends ChangeNotifier {
   Map<String, OtpSyncStatus> getChannelOtpSyncStatuses(int channelIndex) =>
       Map.unmodifiable(_channelOtpSyncStatus[channelIndex] ?? const {});
 
+  /// Subset of [getChannelOtpSyncStatuses] heard from — a sync-check reply,
+  /// or an ordinary offset-bearing chat message (see
+  /// _recordChannelParticipantHeard) — within the last [maxAge]. Used by
+  /// the channel chat screen's participant strip, which is deliberately
+  /// more aggressive about dropping stale names than the OTP Pad screen's
+  /// all-time list: someone not heard from in a while has more likely
+  /// stepped away or gone out of range than stayed present but perpetually
+  /// unsynced, so the strip just stops showing them rather than leaving a
+  /// permanently-greyed-out entry.
+  Map<String, OtpSyncStatus> getActiveChannelParticipants(
+    int channelIndex, {
+    Duration maxAge = const Duration(minutes: 10),
+  }) {
+    final perChannel = _channelOtpSyncStatus[channelIndex];
+    if (perChannel == null || perChannel.isEmpty) return const {};
+    final cutoff = DateTime.now().subtract(maxAge);
+    final result = <String, OtpSyncStatus>{};
+    for (final entry in perChannel.entries) {
+      final heardAt = entry.value.repliedAt ?? entry.value.checkedAt;
+      if (heardAt.isAfter(cutoff)) {
+        result[entry.key] = entry.value;
+      }
+    }
+    return result;
+  }
+
   /// Sends a sync-check request to [contactKeyHex]'s DM pad, reporting this
   /// device's own current counters. A reply (see
   /// _maybeHandleContactSyncMessage) updates [getContactOtpSyncStatus]; if
@@ -1508,6 +1534,54 @@ class MeshCoreConnector extends ChangeNotifier {
     }
     notifyListeners();
     return true;
+  }
+
+  /// Records that [senderName] was just heard from on [channelIndex]'s OTP
+  /// channel — from an ordinary offset-bearing chat message, not a
+  /// sync-check (see [_maybeHandleChannelSyncMessage] for that path, which
+  /// writes into the same [_channelOtpSyncStatus] map). [claimedOffset]
+  /// null means the message carried no offset framing (a legacy sender, or
+  /// something that isn't OTP at all) — still counts as "heard" (keeps
+  /// them from disappearing from the participant strip — see
+  /// [getActiveChannelParticipants]), but leaves any previously known
+  /// in-sync verdict alone rather than overwriting it with an unknown one.
+  void _recordChannelParticipantHeard(
+    int channelIndex,
+    String senderName, {
+    required int? claimedOffset,
+    required int currentOffset,
+  }) {
+    final perChannel = _channelOtpSyncStatus.putIfAbsent(
+      channelIndex,
+      () => {},
+    );
+    final existing = perChannel[senderName];
+    if (claimedOffset == null) {
+      perChannel[senderName] =
+          (existing ?? OtpSyncStatus(checkedAt: DateTime.now())).copyWith(
+            repliedAt: DateTime.now(),
+          );
+      notifyListeners();
+      return;
+    }
+    // Same sign convention as _maybeHandleChannelSyncMessage/OtpSyncStatus:
+    // positive drift means THIS device's counter is ahead of theirs.
+    final drift = currentOffset - claimedOffset;
+    perChannel[senderName] = OtpSyncStatus(
+      checkedAt: existing?.checkedAt ?? DateTime.now(),
+      repliedAt: DateTime.now(),
+      inSync: drift == 0,
+      driftBytes: drift,
+      driftDirection: drift == 0
+          ? null
+          : (drift > 0 ? 'mine-ahead' : 'theirs-ahead'),
+    );
+    // Some callers (the "ahead"/resync-gap branch in _dispatchOtpChannel)
+    // return early with no chat message to display and no notifyListeners
+    // of their own further down — without this, the participant strip
+    // would only pick up this update whenever something else happens to
+    // rebuild it.
+    notifyListeners();
   }
 
   // ── OTP pad auto-resync ────────────────────────────────────────────────
@@ -2022,6 +2096,21 @@ class MeshCoreConnector extends ChangeNotifier {
       claimedOffset = offsetFramed.offset;
       text = offsetFramed.cipherHex;
     }
+
+    // Feeds the participant-sync tracking (see getActiveChannelParticipants
+    // / the channel chat screen's participant strip) from ordinary
+    // conversation, not just explicit sync-check replies — every
+    // offset-bearing message someone sends is itself a statement of where
+    // they think the pad is, at least as good a signal as a sync-check.
+    // Deliberately BEFORE the cache-hit/collision/ahead checks below: even
+    // a duplicate, a collision, or a gap is still evidence this sender was
+    // just heard from, which is exactly what the strip needs to know.
+    _recordChannelParticipantHeard(
+      channelIndex,
+      senderName,
+      claimedOffset: claimedOffset,
+      currentOffset: pad.offset,
+    );
 
     final hex = OtpService.extractCiphertextHex(text);
     if (hex == null) return const (handled: false, displayText: null);
