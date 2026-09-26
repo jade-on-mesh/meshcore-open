@@ -9,6 +9,12 @@ class MessageStatusIcon extends StatefulWidget {
   final bool isFailed;
   final bool isPending;
   final bool isRepeated;
+  // OTP store-and-forward: this outgoing message exhausted its normal
+  // retry budget and is sitting in the per-contact waiting queue instead
+  // of having failed outright - see MessageStatus.waiting. Mutually
+  // exclusive with the other flags (a message is never both pending and
+  // waiting), same as every other status here.
+  final bool isWaiting;
   final double size;
 
   /// Base tint for the sent/sending state. On a colored (outgoing) bubble a
@@ -22,6 +28,7 @@ class MessageStatusIcon extends StatefulWidget {
     this.isFailed = false,
     this.isPending = false,
     this.isRepeated = false,
+    this.isWaiting = false,
     this.size = 14,
     this.onColor,
   });
@@ -73,6 +80,24 @@ class _MessageStatusIconState extends State<MessageStatusIcon>
       return Semantics(
         label: l10n.messageStatus_failed,
         child: Icon(Icons.cancel, size: size, color: colorScheme.error),
+      );
+    }
+
+    if (widget.isWaiting) {
+      // No l10n key for this yet (see the project's other not-yet-l10n'd
+      // strings) - a plain hourglass distinguishes "queued for
+      // store-and-forward" from the pulsing dots of an actively in-flight
+      // send, since the two states mean very different things: pending is
+      // "sending right now", waiting is "given up retrying for now, will
+      // try again once this contact is heard from or on the next
+      // background sweep".
+      return Semantics(
+        label: 'Waiting to send',
+        child: Icon(
+          Icons.hourglass_bottom,
+          size: size,
+          color: MeshPalette.signal.withValues(alpha: 0.9),
+        ),
       );
     }
 

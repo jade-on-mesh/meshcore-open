@@ -940,20 +940,35 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     }
     setState(() => _busy = true);
     final label = _labelController.text.trim();
-    if (_isChannel) {
-      await connector.setChannelOtpPad(
-        widget.channel!.index,
-        hex,
-        _selectedRole,
-        label: label.isEmpty ? null : label,
+    try {
+      if (_isChannel) {
+        await connector.setChannelOtpPad(
+          widget.channel!.index,
+          hex,
+          _selectedRole,
+          label: label.isEmpty ? null : label,
+        );
+      } else {
+        await connector.setContactOtpPad(
+          widget.contact!.publicKeyHex,
+          hex,
+          _selectedRole,
+          label: label.isEmpty ? null : label,
+        );
+      }
+    } on OtpPadImportBlockedException catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${e.queuedCount} message(s) are still queued waiting to send '
+            'to this contact - cancel or wait for them to send before '
+            'importing a new pad.',
+          ),
+        ),
       );
-    } else {
-      await connector.setContactOtpPad(
-        widget.contact!.publicKeyHex,
-        hex,
-        _selectedRole,
-        label: label.isEmpty ? null : label,
-      );
+      return;
     }
     if (!mounted) return;
     setState(() {

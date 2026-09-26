@@ -246,6 +246,35 @@ class _ChatScreenState extends State<ChatScreen> {
               final otpEnabled = connector.isContactOtpEnabled(
                 contact.publicKeyHex,
               );
+              if (!otpEnabled) return const SizedBox.shrink();
+              // Ports OTP_3_RC1.lua's chat-screen "ReSync" button: force-
+              // reload this contact's pad from storage (discarding
+              // whatever's cached — see resyncContact's own doc comment)
+              // and fire an immediate, unthrottled sync-check, without
+              // waiting for the next periodic/backed-off automatic one.
+              return IconButton(
+                tooltip: 'ReSync',
+                icon: const Icon(Icons.sync),
+                onPressed: () {
+                  final ok = connector.resyncContact(contact.publicKeyHex);
+                  showDismissibleSnackBar(
+                    context,
+                    content: Text(
+                      ok
+                          ? 'Pad reloaded — sync check sent'
+                          : 'No OTP pad for this contact',
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) {
+              final contact = _resolveContact(connector);
+              final otpEnabled = connector.isContactOtpEnabled(
+                contact.publicKeyHex,
+              );
               return IconButton(
                 tooltip: otpEnabled ? 'OTP Pad (encrypting)' : 'OTP Pad',
                 icon: Icon(
@@ -1330,7 +1359,15 @@ class _ChatScreenState extends State<ChatScreen> {
                   _markAsUnread(message);
                 },
               ),
-            if (message.isOutgoing && message.status == MessageStatus.failed)
+            if (message.isOutgoing &&
+                (message.status == MessageStatus.failed ||
+                    // A queued store-and-forward message can also be
+                    // retried by hand rather than waiting for the next
+                    // automatic trigger (something heard from the contact,
+                    // or the background sweep) - resendMessage's
+                    // delete-then-send also correctly drops it out of the
+                    // waiting queue first.
+                    message.status == MessageStatus.waiting))
               ListTile(
                 leading: const Icon(Icons.refresh),
                 title: Text(context.l10n.common_retry),
@@ -1768,7 +1805,26 @@ class _MessageBubble extends StatelessWidget {
                                         message.status == MessageStatus.pending,
                                     isFailed:
                                         message.status == MessageStatus.failed,
+                                    isWaiting:
+                                        message.status == MessageStatus.waiting,
                                   ),
+                                  // OTP store-and-forward: this send gave up
+                                  // retrying and is sitting queued for this
+                                  // contact - show how long, the same way a
+                                  // "waiting for a path" caption would read on
+                                  // the Lua side's chat bubble.
+                                  if (message.status == MessageStatus.waiting &&
+                                      message.waitingSinceAt != null) ...[
+                                    const SizedBox(width: 2),
+                                    Text(
+                                      'Waiting for a path'
+                                      '${_relativeTimeSuffix(message.waitingSinceAt!)}',
+                                      style: MeshTheme.mono(
+                                        fontSize: 9.5 * textScale,
+                                        color: metaColor,
+                                      ),
+                                    ),
+                                  ],
                                 ],
                                 if (enableTracing &&
                                     message.tripTimeMs != null &&
@@ -1969,6 +2025,19 @@ class _MessageBubble extends StatelessWidget {
     final hour = time.hour.toString().padLeft(2, '0');
     final minute = time.minute.toString().padLeft(2, '0');
     return '$hour:$minute';
+  }
+
+  // " (just now)" / " (5m)" / " (2h)" — same relative-time-ago shape used
+  // elsewhere in this app (routing_sheet.dart/map_screen.dart), but plain
+  // English rather than routed through l10n, matching every other
+  // not-yet-localized string this store-and-forward feature added (see the
+  // "no l10n" known gap).
+  String _relativeTimeSuffix(DateTime since) {
+    final diff = DateTime.now().difference(since);
+    if (diff.inSeconds < 60) return ' (just now)';
+    if (diff.inMinutes < 60) return ' (${diff.inMinutes}m)';
+    if (diff.inHours < 24) return ' (${diff.inHours}h)';
+    return ' (${diff.inDays}d)';
   }
 }
 

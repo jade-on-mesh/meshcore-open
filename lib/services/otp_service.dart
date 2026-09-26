@@ -38,6 +38,22 @@ class OtpDecryptException implements Exception {
   String toString() => 'OtpDecryptException: $message';
 }
 
+/// Thrown when a contact's pad is about to be replaced while store-and-
+/// forward still has messages queued for them. Importing a new pad resets
+/// both offsets to zero (see setContactOtpPad's own doc comment), which
+/// would silently corrupt or desync any ciphertext already queued against
+/// the OLD pad's byte offsets - mirrors OTP_3_RC1.lua's import_pad_hex
+/// refusing while `waiting_queue[id]` is non-empty.
+class OtpPadImportBlockedException implements Exception {
+  final int queuedCount;
+  OtpPadImportBlockedException(this.queuedCount);
+
+  @override
+  String toString() =>
+      'OtpPadImportBlockedException: $queuedCount message(s) still queued '
+      'for store-and-forward - cancel or wait for them to send first';
+}
+
 /// Pure one-time-pad encrypt/decrypt for MeshCore Open text messages.
 ///
 /// This is a direct port of the XOR core proved out on real hardware in the

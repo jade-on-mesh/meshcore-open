@@ -281,6 +281,13 @@ class AppSettingsService extends ChangeNotifier {
     await updateSettings(_settings.copyWith(jumpToOldestUnread: value));
   }
 
+  /// See [AppSettings.channelParticipantStripEnabled].
+  Future<void> setChannelParticipantStripEnabled(bool value) async {
+    await updateSettings(
+      _settings.copyWith(channelParticipantStripEnabled: value),
+    );
+  }
+
   Future<void> setImageMessagesEnabled(bool value) async {
     await updateSettings(_settings.copyWith(imageMessagesEnabled: value));
   }

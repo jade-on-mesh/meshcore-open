@@ -121,6 +121,14 @@ class AppSettings {
   final bool jumpToOldestUnread;
   final bool imageMessagesEnabled;
 
+  /// Whether the channel chat screen's participant sync strip (patch 0010 —
+  /// per-participant "who's synced" chips above the message list) is shown
+  /// at all. Defaults OFF per an explicit follow-up request (matching Lua's
+  /// `show_participant_strip`, which defaults off the same way as of that
+  /// same request) — it costs real vertical space on every channel screen,
+  /// so someone has to opt in rather than opt out.
+  final bool channelParticipantStripEnabled;
+
   /// Whether a received image is decoded as soon as it is reassembled.
   ///
   /// Off by default and deliberately so: a decode peaks around 2.16 GiB
@@ -221,6 +229,7 @@ class AppSettings {
     this.tcpServerAddress = '',
     this.tcpServerPort = 0,
     this.jumpToOldestUnread = false,
+    this.channelParticipantStripEnabled = false,
     this.imageMessagesEnabled = false,
     this.imageProcessAutomatically = false,
     this.imageCodecEnabled = false,
@@ -296,6 +305,7 @@ class AppSettings {
       'tcp_server_address': tcpServerAddress,
       'tcp_server_port': tcpServerPort,
       'jump_to_oldest_unread': jumpToOldestUnread,
+      'channel_participant_strip_enabled': channelParticipantStripEnabled,
       'image_messages_enabled': imageMessagesEnabled,
       'image_process_automatically': imageProcessAutomatically,
       'image_codec_enabled': imageCodecEnabled,
@@ -394,6 +404,8 @@ class AppSettings {
       tcpServerAddress: json['tcp_server_address'] as String? ?? '',
       tcpServerPort: json['tcp_server_port'] as int? ?? 0,
       jumpToOldestUnread: json['jump_to_oldest_unread'] as bool? ?? false,
+      channelParticipantStripEnabled:
+          json['channel_participant_strip_enabled'] as bool? ?? false,
       imageMessagesEnabled: json['image_messages_enabled'] as bool? ?? false,
       imageProcessAutomatically:
           json['image_process_automatically'] as bool? ?? false,
@@ -507,6 +519,7 @@ class AppSettings {
     String? tcpServerAddress,
     int? tcpServerPort,
     bool? jumpToOldestUnread,
+    bool? channelParticipantStripEnabled,
     bool? imageMessagesEnabled,
     bool? imageProcessAutomatically,
     bool? imageCodecEnabled,
@@ -581,6 +594,8 @@ class AppSettings {
       tcpServerAddress: tcpServerAddress ?? this.tcpServerAddress,
       tcpServerPort: tcpServerPort ?? this.tcpServerPort,
       jumpToOldestUnread: jumpToOldestUnread ?? this.jumpToOldestUnread,
+      channelParticipantStripEnabled:
+          channelParticipantStripEnabled ?? this.channelParticipantStripEnabled,
       imageMessagesEnabled: imageMessagesEnabled ?? this.imageMessagesEnabled,
       imageProcessAutomatically:
           imageProcessAutomatically ?? this.imageProcessAutomatically,

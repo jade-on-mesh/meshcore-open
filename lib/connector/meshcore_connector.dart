@@ -539,6 +539,23 @@ class MeshCoreConnector extends ChangeNotifier {
   final Set<int> _channelSyncBackoff = {};
   final Map<String, Timer> _otpBackoffTimers = {};
   static const Duration _syncBackoffTimeout = Duration(seconds: 30);
+  // OTP store-and-forward (DMs only — channels have no clean single
+  // "is this contact reachable" concept, matching Lua's own DM-only
+  // scoping). Ports OTP_3_RC1.lua's waiting_queue/flush_waiting/
+  // waiting_tick: a single-shot OTP send that exhausts MessageRetryService's
+  // normal retry budget (see RetryServiceConfig.onMaxRetriesExceeded /
+  // _handleOtpSendExhausted below) is queued here instead of failing
+  // outright, and is retried either the moment something is heard from
+  // that contact again (_flushWaitingQueue, called from
+  // _maybeHandleContactSyncMessage) or on a slow background sweep
+  // (_waitingQueueTickTimer) if nothing is heard at all. No time-based
+  // expiry — only a bounded depth, matching Lua's WAITING_QUEUE_CAP.
+  final Map<String, List<Message>> _waitingQueue = {};
+  static const int _waitingQueueCap = 5;
+  final Map<String, DateTime> _lastWaitingFlushAt = {};
+  static const Duration _waitingFlushCooldown = Duration(seconds: 10);
+  Timer? _waitingQueueTickTimer;
+  static const Duration _waitingQueueTickInterval = Duration(minutes: 10);
   bool _lastSentWasCliCommand =
       false; // Track if last sent message was a CLI command
   final Map<String, bool> _contactSmazEnabled = {};
@@ -770,6 +787,14 @@ class MeshCoreConnector extends ChangeNotifier {
 
   Future<void> deleteMessage(Message message) async {
     final contactKeyHex = message.senderKeyHex;
+    // Also strip it out of the OTP store-and-forward waiting queue if it's
+    // sitting there (by messageId, not identity — a caller may be passing
+    // in a re-fetched copy rather than the exact queued instance). A no-op
+    // for a message that was never queued, or was already removed by
+    // _flushWaitingQueue before calling here.
+    _waitingQueue[contactKeyHex]?.removeWhere(
+      (m) => m.messageId == message.messageId,
+    );
     final messages = _conversations[contactKeyHex];
     if (messages == null) return;
     final removed = messages.remove(message);
@@ -1038,6 +1063,18 @@ class MeshCoreConnector extends ChangeNotifier {
     OtpPadRole role, {
     String? label,
   }) async {
+    // Refuse while store-and-forward still has messages queued for this
+    // contact — a queued message's ciphertext was encrypted against the
+    // OLD pad's byte offsets, and this resets both offsets to zero, so
+    // replacing it out from under a queued send would corrupt it (or
+    // silently desync the recipient) exactly like importing over an
+    // in-flight chunked send. Mirrors OTP_3_RC1.lua's import_pad_hex
+    // refusing while waiting_queue[id] is non-empty — the person has to
+    // cancel or wait for the queue to drain first.
+    final queuedCount = waitingQueueLength(contactKeyHex);
+    if (queuedCount > 0) {
+      throw OtpPadImportBlockedException(queuedCount);
+    }
     final pad = OtpPad(
       padHex: padHex,
       role: role,
@@ -1397,6 +1434,35 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpSyncTimeoutTimers[key] = Timer(_otpSyncTimeout, onTimeout);
   }
 
+  /// Manual "ReSync" action — ports OTP_3_RC1.lua's `resync_current_target()`
+  /// (the chat screen's "ReSync" button). Two things, back to back: force-
+  /// reload this contact's pad straight from storage, discarding whatever's
+  /// cached in [_contactOtpPads] (a no-op almost every time, since the cache
+  /// and storage don't normally drift — it only matters if the pad file was
+  /// replaced on disk out from under an already-running session), then fire
+  /// an immediate, unthrottled sync-check exactly like [checkContactPadSync]
+  /// already does for the (currently nonexistent) manual "Check Sync"
+  /// affordance. Returns false (and does nothing else) if there's no pad to
+  /// resync, so the caller can show a "nothing to resync" message the same
+  /// way Lua's toast does.
+  bool resyncContact(String contactKeyHex) {
+    _contactOtpPads.remove(contactKeyHex);
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null) return false;
+    checkContactPadSync(contactKeyHex);
+    return true;
+  }
+
+  /// Channel counterpart of [resyncContact] — ports the same Lua ReSync
+  /// button for a channel target.
+  bool resyncChannel(int channelIndex) {
+    _channelOtpPads.remove(channelIndex);
+    final pad = getChannelOtpPad(channelIndex);
+    if (pad == null) return false;
+    checkChannelPadSync(channelIndex);
+    return true;
+  }
+
   /// Returns true if [text] was a sync-check control message (handled
   /// here, including sending the automatic reply) and must NOT be shown as
   /// a chat message — mirrors how a chunk piece/ack "handled" result
@@ -1409,6 +1475,11 @@ class MeshCoreConnector extends ChangeNotifier {
     // they sent on their own — is proof they're actually reachable right
     // now, so lift any airtime backoff in effect.
     _clearContactSyncBackoff(contact.publicKeyHex);
+    // Same "proof they're actually reachable right now" signal also drives
+    // OTP store-and-forward: attempt the oldest queued message for them,
+    // rate-limited — mirrors Lua's flush_waiting, driven from the same
+    // handle_sync_message spot.
+    _flushWaitingQueue(contact.publicKeyHex);
     final pad = getContactOtpPad(contact.publicKeyHex);
     if (pad != null &&
         !pad.isSharedSequential &&
@@ -1757,6 +1828,36 @@ class MeshCoreConnector extends ChangeNotifier {
   void _stopOtpAutoSyncPolling() {
     _otpAutoSyncPollTimer?.cancel();
     _otpAutoSyncPollTimer = null;
+  }
+
+  // Background fallback for the store-and-forward waiting queue — a single
+  // global periodic sweep (matching every other timer in this class:
+  // _batteryPollTimer, _otpAutoSyncPollTimer, etc. are all one Timer.periodic
+  // iterating internal state, not one Timer per contact) that attempts a
+  // flush for every contact with a non-empty queue, every ~10 minutes,
+  // mirroring OTP_3_RC1.lua's waiting_tick(). This is only the fallback —
+  // the primary trigger is hearing anything at all from that contact (see
+  // _flushWaitingQueue, called from _maybeHandleContactSyncMessage), which
+  // fires far sooner in the common case of the contact coming back into
+  // range.
+  void _startWaitingQueueTicker() {
+    _waitingQueueTickTimer?.cancel();
+    _waitingQueueTickTimer = Timer.periodic(_waitingQueueTickInterval, (
+      timer,
+    ) {
+      if (!isConnected) {
+        timer.cancel();
+        return;
+      }
+      for (final contactKeyHex in _waitingQueue.keys.toList()) {
+        _flushWaitingQueue(contactKeyHex);
+      }
+    });
+  }
+
+  void _stopWaitingQueueTicker() {
+    _waitingQueueTickTimer?.cancel();
+    _waitingQueueTickTimer = null;
   }
 
   // Skips a target while a real chunked send or receive is actually in
@@ -2145,6 +2246,16 @@ class MeshCoreConnector extends ChangeNotifier {
           'channel $channelIndex: collision from $senderName at offset '
           '$claimedOffset (we are at $currentOffset) - message lost',
         );
+        // Force an immediate, unthrottled resync the moment a collision is
+        // detected, rather than waiting for the next periodic/backed-off
+        // check (which passes 6-7's throttling can space out by minutes) -
+        // ports OTP_3_RC1.lua's newest collision-handling behavior. There
+        // is no accompanying "resend": this device never had the lost
+        // message's plaintext to resend (that ciphertext belonged to
+        // whoever collided with it, and Phase 1 never decrypts a collided
+        // message), so all that's actionable here is getting this
+        // channel's own counter caught up as fast as possible.
+        checkChannelPadSync(channelIndex);
         return (
           handled: true,
           displayText:
@@ -3044,6 +3155,7 @@ class MeshCoreConnector extends ChangeNotifier {
         sendMessage: _sendMessageDirect,
         addMessage: _addMessage,
         updateMessage: _updateMessage,
+        onMaxRetriesExceeded: _handleOtpSendExhausted,
         clearContactPath: clearContactPath,
         setContactPath: setContactPath,
         calculateTimeout:
@@ -3275,6 +3387,110 @@ class MeshCoreConnector extends ChangeNotifier {
       notifyListeners();
     }
   }
+
+  // ===================== OTP store-and-forward =====================
+  // Ports OTP_3_RC1.lua's waiting_queue/flush_waiting/waiting_tick (see the
+  // dedicated project-doc section). DM-only, matching Lua: channels have no
+  // clean single "is this contact reachable" signal, and a channel's shared
+  // pad already has its own collision-coordination problem (see the channel
+  // OTP-collision sections) that multi-party queuing would only compound.
+
+  /// [RetryServiceConfig.onMaxRetriesExceeded] — called by MessageRetryService
+  /// the moment an outgoing message would otherwise be marked failed. Claims
+  /// only single-shot OTP sends (message.otpPlaintext != null); anything else
+  /// (plaintext mesh messages, reactions) falls through to the normal failed
+  /// handling exactly as before this feature, since Lua's store-and-forward
+  /// only ever applied to OTP's own ssend path either.
+  bool _handleOtpSendExhausted(Message message, Contact contact) {
+    if (message.otpPlaintext == null) return false;
+    final contactKeyHex = contact.publicKeyHex;
+    final queue = _waitingQueue.putIfAbsent(contactKeyHex, () => []);
+    // Refusing a NEW send once the queue is already at cap (see sendMessage)
+    // is meant to keep this from ever happening — this is a safety net, not
+    // the primary gate.
+    if (queue.length >= _waitingQueueCap) {
+      appLogger.warn(
+        'OTP store-and-forward queue for $contactKeyHex is already at cap '
+        '($_waitingQueueCap) — letting this send fail instead of growing '
+        'the queue further unbounded',
+      );
+      return false;
+    }
+    final waitingMessage = message.copyWith(
+      status: MessageStatus.waiting,
+      waitingSinceAt: DateTime.now(),
+    );
+    queue.add(waitingMessage);
+    _updateMessage(waitingMessage);
+    appLogger.info(
+      'OTP send to $contactKeyHex exhausted retries — queued for '
+      'store-and-forward (${queue.length}/$_waitingQueueCap)',
+    );
+    return true;
+  }
+
+  /// Attempts the oldest queued message for [contactKeyHex], rate-limited by
+  /// [_waitingFlushCooldown] so repeated "heard from them" triggers (several
+  /// sync-check replies in a row, say) don't each cost a retransmission.
+  /// Called both from _maybeHandleContactSyncMessage (the moment anything at
+  /// all is heard from that contact — mirrors Lua's flush_waiting, driven
+  /// from handle_sync_message) and from the background _waitingQueueTickTimer
+  /// sweep (mirrors waiting_tick).
+  void _flushWaitingQueue(String contactKeyHex) {
+    final queue = _waitingQueue[contactKeyHex];
+    if (queue == null || queue.isEmpty) return;
+    final now = DateTime.now();
+    final last = _lastWaitingFlushAt[contactKeyHex];
+    if (last != null && now.difference(last) < _waitingFlushCooldown) return;
+    // Never compete with a real send already in flight for this contact —
+    // same reasoning as every other OTP transmission gate in this file.
+    if (_pendingContactChunkSends.containsKey(contactKeyHex)) return;
+    Contact? contact;
+    for (final c in _contacts) {
+      if (c.publicKeyHex == contactKeyHex) {
+        contact = c;
+        break;
+      }
+    }
+    if (contact == null) return;
+    _lastWaitingFlushAt[contactKeyHex] = now;
+    final oldest = queue.removeAt(0);
+    appLogger.info(
+      'Flushing queued OTP message to $contactKeyHex '
+      '(${queue.length} remaining)',
+    );
+    // Re-drive through the normal send path from the ORIGINAL plaintext,
+    // not a replay of the old ciphertext bytes — the contact's pad offset
+    // has very likely moved on since this was first queued (auto-resync,
+    // or other messages sent in the meantime), so it must be re-encrypted
+    // fresh against the current offset, exactly like Lua's flush_waiting
+    // re-entering send_chat_message rather than retransmitting stale bytes.
+    // The old "waiting" bubble is removed first so the person sees one
+    // bubble transition from "waiting" to "sending", not two bubbles for
+    // what they experience as a single message.
+    final plaintext = oldest.otpPlaintext ?? oldest.text;
+    deleteMessage(oldest);
+    sendMessage(contact, plaintext);
+  }
+
+  /// Drains [contact]'s entire store-and-forward queue without attempting
+  /// to send any of it — used when cancelling, or when the person would
+  /// rather give up than keep waiting. Mirrors OTP_3_RC1.lua's
+  /// cancel_send() draining waiting_queue oldest-first when nothing is
+  /// actively sending.
+  void cancelWaitingQueue(Contact contact) {
+    final queue = _waitingQueue[contact.publicKeyHex];
+    if (queue == null || queue.isEmpty) return;
+    for (final message in List<Message>.from(queue)) {
+      deleteMessage(message);
+    }
+  }
+
+  /// How many messages are currently queued for this contact — surfaced to
+  /// the UI (e.g. to refuse composing yet another send, or to show a queue
+  /// depth badge) without exposing the queue's internal representation.
+  int waitingQueueLength(String contactKeyHex) =>
+      _waitingQueue[contactKeyHex]?.length ?? 0;
 
   Future<TranslationResult?> translateContactMessage(
     String contactKeyHex,
@@ -3781,6 +3997,7 @@ class MeshCoreConnector extends ChangeNotifier {
       await _requestDeviceInfo();
       _startBatteryPolling();
       _startOtpAutoSyncPolling();
+      _startWaitingQueueTicker();
       if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
       var gotSelfInfo = await _waitForSelfInfo(
         timeout: const Duration(seconds: 3),
@@ -3890,6 +4107,7 @@ class MeshCoreConnector extends ChangeNotifier {
       await _requestDeviceInfo();
       _startBatteryPolling();
       _startOtpAutoSyncPolling();
+      _startWaitingQueueTicker();
       if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
 
       var gotSelfInfo = await _waitForSelfInfo(
@@ -4593,6 +4811,7 @@ class MeshCoreConnector extends ChangeNotifier {
     await _requestDeviceInfo();
     _startBatteryPolling();
     _startOtpAutoSyncPolling();
+    _startWaitingQueueTicker();
     if (_radioStatsPollRefCount > 0) _startRadioStatsPolling();
 
     final gotSelfInfo = await _waitForSelfInfo(
@@ -4734,6 +4953,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _setState(MeshCoreConnectionState.disconnecting);
     _stopBatteryPolling();
     _stopOtpAutoSyncPolling();
+    _stopWaitingQueueTicker();
     _stopRadioStatsPolling();
 
     await _usbFrameSubscription?.cancel();
@@ -5173,6 +5393,22 @@ class MeshCoreConnector extends ChangeNotifier {
       appLogger.warn(
         'sendMessage: still sending the previous message to '
         '${contact.publicKeyHex}, dropping this send',
+      );
+      return;
+    }
+
+    // OTP store-and-forward: refuse a brand-new send once this contact's
+    // waiting queue is already at cap, rather than letting it grow
+    // unbounded — mirrors Lua's send_chat_message refusing a 6th queued
+    // send outright. This is the primary gate; _handleOtpSendExhausted's
+    // own cap check is only a safety net for the (shouldn't-happen) case
+    // of a retry exhausting while the queue is already full.
+    if (reactionInfo == null &&
+        isContactOtpEnabled(contact.publicKeyHex) &&
+        waitingQueueLength(contact.publicKeyHex) >= _waitingQueueCap) {
+      appLogger.warn(
+        'sendMessage: store-and-forward queue for ${contact.publicKeyHex} '
+        'is full ($_waitingQueueCap queued) — refusing this send',
       );
       return;
     }
@@ -9111,6 +9347,7 @@ class MeshCoreConnector extends ChangeNotifier {
   void _handleDisconnection() {
     _stopBatteryPolling();
     _stopOtpAutoSyncPolling();
+    _stopWaitingQueueTicker();
     _stopGpsLocationPolling();
     _stopRadioStatsPolling();
     _latestRadioStats = null;
@@ -9285,6 +9522,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _batteryPollTimer?.cancel();
     _otpAutoSyncPollTimer?.cancel();
+    _waitingQueueTickTimer?.cancel();
     _gpsLocationPollTimer?.cancel();
     _radioStatsPollTimer?.cancel();
     for (final timer in _otpSyncTimeoutTimers.values) {

@@ -3,7 +3,14 @@ import '../connector/meshcore_protocol.dart';
 import '../helpers/reaction_helper.dart';
 import 'translation_support.dart';
 
-enum MessageStatus { pending, sent, delivered, failed }
+// `waiting`: an outgoing OTP single-shot send that exhausted its normal
+// retry budget and was handed off to store-and-forward instead of being
+// marked failed outright - it sits queued for this contact and is retried
+// automatically once something is heard from them again (or on a slow
+// background timer), per MeshCoreConnector's waiting-queue machinery. See
+// waitingSinceAt below. Ports OTP_3_RC1.lua's `waiting_queue`/"Waiting for
+// a path" bubble.
+enum MessageStatus { pending, sent, delivered, failed, waiting }
 
 class Message {
   static const Object _unset = Object();
@@ -35,6 +42,10 @@ class Message {
   final int? expectedAckHash;
   final DateTime? sentAt;
   final DateTime? deliveredAt;
+  // When this message entered MessageStatus.waiting (store-and-forward),
+  // so the UI can show a relative "waiting since" caption the same way it
+  // does for sentAt/deliveredAt. Never set for any other status.
+  final DateTime? waitingSinceAt;
   final int? tripTimeMs;
   final int? pathLength;
   final Uint8List pathBytes;
@@ -71,6 +82,7 @@ class Message {
     this.expectedAckHash,
     this.sentAt,
     this.deliveredAt,
+    this.waitingSinceAt,
     this.tripTimeMs,
     this.pathLength,
     Uint8List? pathBytes,
@@ -96,6 +108,7 @@ class Message {
     int? expectedAckHash,
     DateTime? sentAt,
     DateTime? deliveredAt,
+    Object? waitingSinceAt = _unset,
     int? tripTimeMs,
     int? pathLength,
     Uint8List? pathBytes,
@@ -141,6 +154,9 @@ class Message {
       expectedAckHash: expectedAckHash ?? this.expectedAckHash,
       sentAt: sentAt ?? this.sentAt,
       deliveredAt: deliveredAt ?? this.deliveredAt,
+      waitingSinceAt: waitingSinceAt == _unset
+          ? this.waitingSinceAt
+          : waitingSinceAt as DateTime?,
       tripTimeMs: tripTimeMs ?? this.tripTimeMs,
       pathLength: pathLength ?? this.pathLength,
       pathBytes: pathBytes ?? this.pathBytes,

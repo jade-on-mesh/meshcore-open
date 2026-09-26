@@ -336,6 +336,15 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     if (!connector.isChannelOtpEnabled(widget.channel.index)) {
       return const SizedBox.shrink();
     }
+    // Visibility toggle (see the app bar's "People" IconButton) — ports
+    // OTP_3_RC1.lua's show_participant_strip. Defaults OFF per an explicit
+    // follow-up request, matching Lua's own default there.
+    if (!context
+        .watch<AppSettingsService>()
+        .settings
+        .channelParticipantStripEnabled) {
+      return const SizedBox.shrink();
+    }
     final participants = connector.getActiveChannelParticipants(
       widget.channel.index,
       maxAge: _participantStripMaxAge,
@@ -444,6 +453,55 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
           ),
           const SignalGradeIndicator(),
           const RadioStatsIconButton(),
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) {
+              final otpEnabled = connector.isChannelOtpEnabled(
+                widget.channel.index,
+              );
+              if (!otpEnabled) return const SizedBox.shrink();
+              // Ports OTP_3_RC1.lua's chat-screen "ReSync" button for a
+              // channel target — see resyncChannel's own doc comment.
+              return IconButton(
+                tooltip: 'ReSync',
+                icon: const Icon(Icons.sync),
+                onPressed: () {
+                  final ok = connector.resyncChannel(widget.channel.index);
+                  showDismissibleSnackBar(
+                    context,
+                    content: Text(
+                      ok
+                          ? 'Pad reloaded — sync check sent'
+                          : 'No OTP pad for this channel',
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+          Consumer<MeshCoreConnector>(
+            builder: (context, connector, _) {
+              final otpEnabled = connector.isChannelOtpEnabled(
+                widget.channel.index,
+              );
+              if (!otpEnabled) return const SizedBox.shrink();
+              // Ports OTP_3_RC1.lua's participant-strip visibility toggle —
+              // shown only where the strip itself could ever appear
+              // (channel + OTP enabled), same gating as _buildParticipantStrip.
+              final shown = context
+                  .watch<AppSettingsService>()
+                  .settings
+                  .channelParticipantStripEnabled;
+              return IconButton(
+                tooltip: shown ? 'Hide participant sync strip' : 'Show participant sync strip',
+                icon: Icon(shown ? Icons.people : Icons.people_outline),
+                onPressed: () {
+                  context.read<AppSettingsService>().setChannelParticipantStripEnabled(
+                    !shown,
+                  );
+                },
+              );
+            },
+          ),
           Consumer<MeshCoreConnector>(
             builder: (context, connector, _) {
               final otpEnabled = connector.isChannelOtpEnabled(
