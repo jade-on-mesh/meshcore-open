@@ -369,6 +369,13 @@ class _MeshCoreAppState extends State<MeshCoreApp> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     widget.receivedImageStore.setForeground(state == AppLifecycleState.resumed);
+    if (state == AppLifecycleState.resumed) {
+      // See MeshCoreConnector.resumeStalledOtpChunkSends: a backgrounded
+      // app can have its OTP chunk-send retry Timers suspended well past
+      // their nominal 12s, leaving a transfer (and the send guard for
+      // that contact/channel) stuck until this runs.
+      widget.connector.resumeStalledOtpChunkSends();
+    }
     // ~2.7 GiB resident in a backgrounded app is a low-memory-killer kill, so
     // unlike the translation stack the graph is dropped on background rather
     // than held until the radio disconnects.

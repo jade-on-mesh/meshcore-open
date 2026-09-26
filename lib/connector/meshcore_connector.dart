@@ -2294,6 +2294,7 @@ class MeshCoreConnector extends ChangeNotifier {
       (m) => m.copyWith(chunkIndex: state.sctr, chunkTotal: state.chunks.length),
     );
     await _transmitContactChunkCipher(state.contact, state.currentCipherHex!);
+    state.lastAttemptAt = DateTime.now();
     state.cancelRetryTimer();
     state.retryTimer = Timer(
       const Duration(seconds: 12),
@@ -2325,6 +2326,7 @@ class MeshCoreConnector extends ChangeNotifier {
     unawaited(
       _transmitContactChunkCipher(state.contact, state.currentCipherHex!),
     );
+    state.lastAttemptAt = DateTime.now();
     state.retryTimer = Timer(
       const Duration(seconds: 12),
       () => _handleContactChunkTimeout(state),
@@ -2478,6 +2480,7 @@ class MeshCoreConnector extends ChangeNotifier {
       (m) => m.copyWith(chunkIndex: state.sctr, chunkTotal: state.chunks.length),
     );
     await _transmitChannelChunkCipher(state.channel, state.currentCipherHex!);
+    state.lastAttemptAt = DateTime.now();
     state.cancelRetryTimer();
     state.retryTimer = Timer(
       const Duration(seconds: 12),
@@ -2510,10 +2513,43 @@ class MeshCoreConnector extends ChangeNotifier {
     unawaited(
       _transmitChannelChunkCipher(state.channel, state.currentCipherHex!),
     );
+    state.lastAttemptAt = DateTime.now();
     state.retryTimer = Timer(
       const Duration(seconds: 12),
       () => _handleChannelChunkTimeout(state),
     );
+  }
+
+  /// Call when the app returns to the foreground (see main.dart's
+  /// didChangeAppLifecycleState). A backgrounded app can have its chunk-
+  /// send retry Timers suspended by Android for far longer than their
+  /// nominal 12s (Doze / background execution limits) — a transfer that
+  /// was genuinely due for a retry while backgrounded just sits there
+  /// instead, and since _pendingContactChunkSends/_pendingChannelChunkSends
+  /// stay populated the whole time, that also blocks any further send to
+  /// the same contact/channel — not just until the ~60s retry budget
+  /// should have run out, but indefinitely, until the app happens to come
+  /// back to the foreground. This re-evaluates every in-flight chunked
+  /// send against wall-clock time (not the Timer that may never have
+  /// fired) and forces the overdue ones through the normal timeout
+  /// handler immediately, exactly as if their Timer had fired on time.
+  void resumeStalledOtpChunkSends() {
+    const overdueAfter = Duration(seconds: 12);
+    final now = DateTime.now();
+    for (final state in _pendingContactChunkSends.values.toList()) {
+      final last = state.lastAttemptAt;
+      if (last != null && now.difference(last) >= overdueAfter) {
+        state.cancelRetryTimer();
+        _handleContactChunkTimeout(state);
+      }
+    }
+    for (final state in _pendingChannelChunkSends.values.toList()) {
+      final last = state.lastAttemptAt;
+      if (last != null && now.difference(last) >= overdueAfter) {
+        state.cancelRetryTimer();
+        _handleChannelChunkTimeout(state);
+      }
+    }
   }
 
   void _advanceChannelChunkSend(_OtpChannelChunkSend state) {
@@ -5460,14 +5496,19 @@ class MeshCoreConnector extends ChangeNotifier {
       final plainBytes = Uint8List.fromList(utf8.encode(text));
       if (plainBytes.length >
           OtpService.maxPlaintextBytesForChannel(_selfName)) {
-        // Doesn't fit in one packet — hand off to the multi-chunk sender.
-        await _sendChunkedChannelMessage(
-          channel,
-          text,
-          plainBytes,
-          originalText: originalText,
-          translatedLanguageCode: translatedLanguageCode,
-          translationModelId: translationModelId,
+        // Chunked OTP sends are DM-only, never channel - a channel pad is
+        // one shared-sequential counter every participant must agree on,
+        // so a chunk transfer that stalls or loses a part (a real,
+        // observed failure mode - see _sendChunkedContactMessage's DM
+        // counterpart and its git history) doesn't just desync the two
+        // people talking, it desyncs everyone on the channel. The
+        // compose-box UI already refuses this before it reaches here
+        // (see channel_chat_screen.dart's _sendMessage); this is the
+        // backstop for any other caller.
+        appLogger.warn(
+          'sendChannelMessage: message too long for one packet on channel '
+          '${channel.index} (${plainBytes.length} bytes) - refusing rather '
+          'than chunking; use a DM for longer OTP messages',
         );
         return;
       }
@@ -9680,6 +9721,17 @@ abstract class _OtpChunkSend {
 
   int retryCount = 0;
   Timer? retryTimer;
+
+  /// Wall-clock time of the last real transmit attempt for the current
+  /// chunk. Used by MeshCoreConnector.resumeStalledOtpChunkSends to tell
+  /// a retry that's genuinely overdue from one that's simply early —
+  /// retryTimer alone can't answer that after the app has been
+  /// backgrounded, since Android can suspend a plain Dart Timer for far
+  /// longer than its nominal duration (Doze / background execution
+  /// limits), silently leaving this transfer (and the send guard that
+  /// blocks anything else to this contact/channel while it's in flight)
+  /// stuck long past whatever its real retry budget should have been.
+  DateTime? lastAttemptAt;
 
   _OtpChunkSend({
     required this.tid,

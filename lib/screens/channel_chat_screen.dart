@@ -31,7 +31,6 @@ import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
 import '../services/image_chunk_transport.dart';
 import '../services/image_codec_service.dart';
-import '../services/otp_chunk_service.dart';
 import '../services/otp_service.dart';
 import '../services/received_image_store.dart';
 import '../services/translation_service.dart';
@@ -1841,12 +1840,13 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
   Widget _buildInputBar() {
     final connector = context.watch<MeshCoreConnector>();
     final maxBytes = connector.isChannelOtpEnabled(widget.channel.index)
-        // Longer OTP messages now get automatically split into multiple
-        // packets (see otp_chunk_service.dart), so the compose-box limit is
-        // the much larger multi-chunk cap, not the single-packet one.
-        ? OtpChunkService.maxChunkedPlaintextBytesForChannel(
-            connector.selfName,
-          )
+        // Chunked OTP sends are DM-only (see sendChannelMessage) - a
+        // channel pad is one shared-sequential counter every participant
+        // must agree on, and a stuck/lost chunk mid-transfer desyncs
+        // everyone on the channel, not just the two people talking. So
+        // the compose-box limit here is the single-packet cap, same as
+        // a non-OTP channel message.
+        ? OtpService.maxPlaintextBytesForChannel(connector.selfName)
         : maxChannelMessageBytes(connector.selfName);
     final settings = context.watch<AppSettingsService>().settings;
     final imageCodecDownloading = _isImageCodecDownloading(context);
@@ -2132,10 +2132,10 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     final otpEnabled = connector.isChannelOtpEnabled(widget.channel.index);
 
     if (otpEnabled) {
-      // Same reasoning as chat_screen.dart's _sendMessage: messages over one
-      // packet's worth of plaintext are automatically split into multiple
-      // chunked packets, so the real ceiling is the multi-chunk cap.
-      final maxPlainBytes = OtpChunkService.maxChunkedPlaintextBytesForChannel(
+      // Chunked OTP sends are DM-only - see the note on _buildInputBar's
+      // maxBytes above. A channel message over one packet's worth of
+      // plaintext is refused outright rather than split.
+      final maxPlainBytes = OtpService.maxPlaintextBytesForChannel(
         connector.selfName,
       );
       if (OtpService.plaintextByteLength(messageText) > maxPlainBytes) {
