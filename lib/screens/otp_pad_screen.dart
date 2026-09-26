@@ -69,6 +69,19 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       ? OtpService.maxPlaintextBytesForChannel(connector.selfName)
       : OtpService.maxPlaintextBytesForContact();
 
+  /// The Party A/B role this DM would get automatically, or `null` when it
+  /// can't be resolved yet (e.g. this device's own public key isn't known
+  /// yet) or this is a channel (channels have no A/B role at all). Uses the
+  /// same deterministic tie-break as the Lua app's `resolve_dm_role`, so
+  /// both sides land on complementary roles without coordinating by hand.
+  OtpPadRole? _autoResolvedRole(MeshCoreConnector connector) {
+    if (_isChannel) return null;
+    return resolveDmRole(
+      selfPublicKeyHex: connector.selfPublicKeyHex,
+      contactPublicKeyHex: widget.contact!.publicKeyHex,
+    );
+  }
+
   // The 4 sizes always offered, regardless of what's currently imported.
   static const List<int> _fixedGenerateSizes = [
     512,
@@ -152,7 +165,7 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
                 _buildManageCard(context, connector, pad),
               ] else ...[
                 const SectionHeader('Set up encryption'),
-                _buildSetupCard(context, connector),
+                _buildSetupCard(context, connector, _autoResolvedRole(connector)),
               ],
             ],
           );
@@ -655,7 +668,11 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
 
   // ── Setup card (no pad yet) ─────────────────────────────────────────
 
-  Widget _buildSetupCard(BuildContext context, MeshCoreConnector connector) {
+  Widget _buildSetupCard(
+    BuildContext context,
+    MeshCoreConnector connector,
+    OtpPadRole? autoRole,
+  ) {
     final scheme = Theme.of(context).colorScheme;
     return Column(
       children: [
@@ -683,6 +700,39 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               ],
             ),
           )
+        else if (autoRole != null)
+          // Both sides can derive the same role from their own and the
+          // contact's public key, so there's nothing to coordinate by
+          // hand anymore. No picker: showing one would invite someone to
+          // "fix" a role that was never wrong.
+          MeshCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.auto_awesome, size: 18, color: scheme.primary),
+                    const SizedBox(width: 8),
+                    Text(
+                      'Party ${autoRole.label} — resolved automatically',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Worked out from this device\'s and this contact\'s keys, '
+                  'so the other side automatically lands on the opposite '
+                  'role — nothing to agree on beforehand.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          )
         else
           MeshCard(
             child: Column(
@@ -696,8 +746,10 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Agree with the other person beforehand — one of you is A, '
-                  'the other is B. Getting it backwards just means messages '
+                  "This device's own key isn't known yet, so the role can't "
+                  'be worked out automatically this time — agree with the '
+                  'other person beforehand instead: one of you is A, the '
+                  "other is B. Getting it backwards just means messages "
                   "won't decrypt; nothing is silently reused.",
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: scheme.onSurfaceVariant,
@@ -853,7 +905,7 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
-                  onPressed: _busy ? null : () => _importPad(connector),
+                  onPressed: _busy ? null : () => _importPad(connector, autoRole),
                   icon: _busy
                       ? const SizedBox(
                           width: 16,
@@ -915,7 +967,16 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
     return cleaned.toLowerCase();
   }
 
-  Future<void> _importPad(MeshCoreConnector connector) async {
+  Future<void> _importPad(
+    MeshCoreConnector connector,
+    OtpPadRole? autoRole,
+  ) async {
+    // Prefer the auto-resolved role whenever one is available, even if a
+    // stale manual selection is sitting in _selectedRole (e.g. this
+    // device's own key became known after the screen first built) - the
+    // manual picker is only ever shown, and only ever the source of
+    // truth, when autoRole is null.
+    final role = autoRole ?? _selectedRole;
     final hex = _normalizeHex(_pasteController.text);
     if (hex == null) {
       setState(
@@ -945,14 +1006,14 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
         await connector.setChannelOtpPad(
           widget.channel!.index,
           hex,
-          _selectedRole,
+          role,
           label: label.isEmpty ? null : label,
         );
       } else {
         await connector.setContactOtpPad(
           widget.contact!.publicKeyHex,
           hex,
-          _selectedRole,
+          role,
           label: label.isEmpty ? null : label,
         );
       }
@@ -1046,9 +1107,10 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
                 'this group must import this exact same pad — there is no '
                 'role to pick for a shared group pad.'
           : 'This shows the raw pad in plain sight — make sure no one else '
-                'can see your screen while the other device scans it. The other '
-                'person must pick the opposite role (${pad.role == OtpPadRole.a ? 'B' : 'A'}) '
-                'when they import it.',
+                'can see your screen while the other device scans it. Their '
+                'app will normally work out on its own that they\'re Party '
+                '${pad.role == OtpPadRole.a ? 'B' : 'A'} for this pad; if it '
+                "can't, they'll need to pick that role by hand.",
     );
   }
 

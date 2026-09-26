@@ -27,6 +27,28 @@ enum OtpPadRole {
       value.trim().toUpperCase() == 'B' ? OtpPadRole.b : OtpPadRole.a;
 }
 
+/// Deterministic, symmetric Party A/B tie-break shared byte-for-byte with
+/// the Lua app's `resolve_dm_role`: whichever side's own public-key hex
+/// sorts lexicographically lower (ASCII, lowercased first) is Party A, the
+/// other is Party B. Equal keys (should never happen for two distinct
+/// devices) default to A.
+///
+/// Returns `null` — never a guess — when either side's public key isn't
+/// available yet (e.g. the radio hasn't reported this device's own key).
+/// Callers must fall back to letting the person pick manually rather than
+/// defaulting to a role, since a same-role collision on both sides is not
+/// detectable by the sync-check (it only catches a pad-length mismatch).
+OtpPadRole? resolveDmRole({
+  required String? selfPublicKeyHex,
+  required String? contactPublicKeyHex,
+}) {
+  if (selfPublicKeyHex == null || selfPublicKeyHex.isEmpty) return null;
+  if (contactPublicKeyHex == null || contactPublicKeyHex.isEmpty) return null;
+  final mine = selfPublicKeyHex.toLowerCase();
+  final theirs = contactPublicKeyHex.toLowerCase();
+  return mine.compareTo(theirs) <= 0 ? OtpPadRole.a : OtpPadRole.b;
+}
+
 /// How a pad's bytes are consumed as messages are sent and received.
 ///
 /// This mirrors WADAMESH OTP_2_RC15.lua's `pmi_v` party-mode setting and
