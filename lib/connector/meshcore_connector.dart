@@ -26,6 +26,7 @@ import '../storage/passphrase_lock_store.dart';
 import '../services/app_debug_log_service.dart';
 import '../services/otp_service.dart';
 import '../services/otp_chunk_service.dart';
+import '../services/otp_channel_offset_service.dart';
 import '../services/otp_sync_service.dart';
 import '../services/passphrase_lock_service.dart';
 import '../services/ble_debug_log_service.dart';
@@ -1831,18 +1832,28 @@ class MeshCoreConnector extends ChangeNotifier {
     return ciphertext;
   }
 
-  Future<String> _encryptForChannel(int channelIndex, String plaintext) async {
+  /// Returns both the ciphertext and the pad offset it was encrypted
+  /// against (captured BEFORE [_consumePadForSend] advances it) — the
+  /// caller wraps that offset onto the OUTGOING wire text only (see
+  /// [OtpChannelOffsetService]) so a receiver can detect a collision with
+  /// another sender instead of just decrypting whatever's at its own
+  /// current front. The stored/local ciphertext record stays unwrapped.
+  Future<({String cipherHex, int claimedOffset})> _encryptForChannel(
+    int channelIndex,
+    String plaintext,
+  ) async {
     final pad = getChannelOtpPad(channelIndex);
     if (pad == null) {
       throw OtpPadExhaustedException(neededBytes: 0, availableBytes: 0);
     }
+    final claimedOffset = pad.offset;
     final needed = OtpService.plaintextByteLength(plaintext);
     final consumption = _consumePadForSend(pad, needed);
     final ciphertext = OtpService.encrypt(plaintext, consumption.keyBytes);
     _channelOtpPads[channelIndex] = consumption.updated;
     await _otpPadStore.saveChannelPad(channelIndex, consumption.updated);
     _requestPromptChannelSyncCheck(channelIndex);
-    return ciphertext;
+    return (cipherHex: ciphertext, claimedOffset: claimedOffset);
   }
 
   /// Records that ciphertext hex [hex] decrypted to [plaintext] (empty
@@ -1969,7 +1980,27 @@ class MeshCoreConnector extends ChangeNotifier {
     if (pad == null || !pad.enabled) {
       return const (handled: false, displayText: null);
     }
-    final hex = OtpService.extractCiphertextHex(rawText);
+
+    // Channel-only explicit pad-offset framing (see OtpChannelOffsetService)
+    // - the real architectural gap this fixes: a shared-sequential channel
+    // pad has no per-sender split, so two participants who transmit close
+    // enough together that neither has heard the other's message can
+    // encrypt against the SAME pad bytes. Without a claimed offset to check
+    // against, this device would just decrypt whatever's at its own
+    // current front and get garbage for whichever collided message it
+    // processes second. A message with no z2 prefix (an older build, or
+    // the Lua side before this ships there) falls through unchanged -
+    // claimedOffset stays null and every check below is skipped, exactly
+    // as before this fix.
+    int? claimedOffset;
+    var text = rawText;
+    final offsetFramed = OtpChannelOffsetService.parse(rawText);
+    if (offsetFramed != null) {
+      claimedOffset = offsetFramed.offset;
+      text = offsetFramed.cipherHex;
+    }
+
+    final hex = OtpService.extractCiphertextHex(text);
     if (hex == null) return const (handled: false, displayText: null);
 
     final cached = _otpDecryptCache[hex];
@@ -1977,10 +2008,52 @@ class MeshCoreConnector extends ChangeNotifier {
       final chunkInfo = _otpChunkHexIndex[hex];
       if (chunkInfo != null) {
         // Same idempotent-redelivery reasoning as the contact path above.
+        // This deliberately runs BEFORE the offset compare below: a chunk
+        // the sender re-transmitted because it never heard our ack has a
+        // "stale" offset by now too, and that's not a collision, it's a
+        // duplicate we've already fully processed — the cache hit on exact
+        // ciphertext content (not offset) is what correctly tells the two
+        // apart.
         _ackChunkFromChannelSender(senderName, chunkInfo.tid, chunkInfo.idx);
         return const (handled: true, displayText: null);
       }
       return (handled: true, displayText: cached.isEmpty ? null : cached);
+    }
+
+    if (claimedOffset != null) {
+      final currentOffset = pad.offset;
+      if (claimedOffset < currentOffset) {
+        // Collision: this exact ciphertext is new (missed the cache-hit
+        // dedup above), but it claims pad bytes we've already spent — on
+        // our own send or an earlier receive. There's no historical record
+        // of past offsets to recover which slice it actually wanted, so
+        // unlike a resync gap this specific message is simply gone; say so
+        // plainly instead of attempting a decrypt that can only be wrong.
+        appLogger.warn(
+          'channel $channelIndex: collision from $senderName at offset '
+          '$claimedOffset (we are at $currentOffset) - message lost',
+        );
+        return (
+          handled: true,
+          displayText:
+              '⚠️ Channel message from $senderName lost — collided with '
+              'another sender',
+        );
+      }
+      if (claimedOffset > currentOffset) {
+        // We're behind what this message needs - most likely a predecessor
+        // we haven't received yet. Feed the EXISTING auto-resync
+        // grace-period machinery (_trackChannelResyncGap) with this
+        // concrete, certain offset - an actual message declaring it, not
+        // just a self-reported sync-check counter - so catch-up doesn't
+        // have to wait for the next throttled periodic check. This
+        // message can't be decrypted yet either (its bytes are past our
+        // current front), so it's suppressed, not buffered for a retry.
+        _trackChannelResyncGap(channelIndex, senderName, claimedOffset);
+        return const (handled: true, displayText: null);
+      }
+      // claimedOffset == currentOffset: exactly the next expected message -
+      // fall through to the ordinary decrypt path below, unchanged.
     }
 
     final cipherByteLen = hex.length ~/ 2;
@@ -5516,9 +5589,16 @@ class MeshCoreConnector extends ChangeNotifier {
 
     String wireText = text;
     String? otpPlaintext;
+    // Claimed pad offset for THIS ciphertext, wrapped onto the outbound
+    // wire text only (see OtpChannelOffsetService) - the locally stored
+    // ChannelMessage record keeps the bare, unwrapped ciphertext, same as
+    // before this fix.
+    int? claimedOffset;
     if (isChannelOtpEnabled(channel.index)) {
       try {
-        wireText = await _encryptForChannel(channel.index, text);
+        final encrypted = await _encryptForChannel(channel.index, text);
+        wireText = encrypted.cipherHex;
+        claimedOffset = encrypted.claimedOffset;
         otpPlaintext = text;
       } on OtpPadExhaustedException catch (e) {
         appLogger.warn(
@@ -5542,7 +5622,13 @@ class MeshCoreConnector extends ChangeNotifier {
     _pendingChannelSentQueue.add(message.messageId);
     notifyListeners();
 
-    final outboundText = prepareChannelOutboundText(channel.index, wireText);
+    final wireTextForRadio = claimedOffset != null
+        ? OtpChannelOffsetService.wrap(claimedOffset, wireText)
+        : wireText;
+    final outboundText = prepareChannelOutboundText(
+      channel.index,
+      wireTextForRadio,
+    );
     await _runScopedChannelSend(() async {
       await _waitForRadioQuiet(lastInboundRxTime: _lastChannelMsgRxTime);
       await _sendFrameAndWaitForCommandAck(
@@ -7583,6 +7669,12 @@ class MeshCoreConnector extends ChangeNotifier {
         trimmed.startsWith('g:') ||
         trimmed.startsWith('m:') ||
         OtpSyncService.looksLikeSyncMessage(trimmed) ||
+        // z2-framed channel ciphertext (see OtpChannelOffsetService) isn't
+        // pure hex any more (it has the offset + a pipe ahead of the hex),
+        // so it fails looksLikeCiphertextHex below and would otherwise fall
+        // through to Smaz/Cyr2Lat, which corrupts it exactly like it would
+        // corrupt raw ciphertext.
+        OtpChannelOffsetService.looksLikeOffsetMessage(trimmed) ||
         (isChannelOtpEnabled(channelIndex) &&
             OtpService.looksLikeCiphertextHex(trimmed));
     if (!isStructuredPayload) {
