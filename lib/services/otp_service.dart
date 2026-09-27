@@ -54,6 +54,22 @@ class OtpPadImportBlockedException implements Exception {
       'for store-and-forward - cancel or wait for them to send first';
 }
 
+/// Thrown when an OTP pad import is attempted for the Public channel.
+///
+/// The Public channel is the one channel everyone on the mesh shares by
+/// construction (a fixed, well-known PSK - see [Channel.publicChannelPsk]),
+/// so it's meant to stay in the clear for anyone listening; "encrypting"
+/// it with a pad only two people actually hold would give a false sense of
+/// privacy to everyone else still reading it in plain text, and there's no
+/// way to agree a shared secret with "everyone on the mesh" in the first
+/// place. Refused unconditionally - there's no override.
+class OtpPublicChannelBlockedException implements Exception {
+  @override
+  String toString() =>
+      'OtpPublicChannelBlockedException: OTP is not available for the '
+      'Public channel';
+}
+
 /// Pure one-time-pad encrypt/decrypt for MeshCore Open text messages.
 ///
 /// This is a direct port of the XOR core proved out on real hardware in the

@@ -151,6 +151,9 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
           if (connector.otpLocked) {
             return _buildLockedBody(context);
           }
+          if (_isChannel && widget.channel!.isPublicChannel) {
+            return _buildPublicChannelBlockedBody(context);
+          }
           final pad = _currentPad(connector);
           return ListView(
             padding: const EdgeInsets.only(bottom: 32),
@@ -171,6 +174,57 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
           );
         },
       ),
+    );
+  }
+
+  // ── Public channel placeholder ───────────────────────────────────────
+
+  /// The Public channel is the one channel every device on the mesh
+  /// shares by construction (a fixed, well-known PSK), so it's meant to
+  /// stay in the clear for anyone listening. There's nothing to set up
+  /// here - no pad form, no role picker - since [setChannelOtpPad] would
+  /// just refuse it anyway (see [OtpPublicChannelBlockedException]); this
+  /// screen says so instead of showing controls that can't actually do
+  /// anything.
+  Widget _buildPublicChannelBlockedBody(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        MeshCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(Icons.public_off, color: scheme.primary),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'OTP isn\'t available on the Public channel',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'The Public channel is shared by everyone on the mesh using '
+                "the same well-known key. A pad only you and the group's "
+                "members hold can't actually keep it private - anyone else "
+                'would just see the ciphertext, or nothing, while you got '
+                'a false sense of privacy. Use a private channel or a DM '
+                'if you want OTP encryption.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -1027,6 +1081,19 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
             'to this contact - cancel or wait for them to send before '
             'importing a new pad.',
           ),
+        ),
+      );
+      return;
+    } on OtpPublicChannelBlockedException {
+      // Shouldn't normally be reachable - this screen shows
+      // _buildPublicChannelBlockedBody instead of this form for the
+      // Public channel - but the connector refuses unconditionally
+      // regardless, so this is defense in depth, not the primary gate.
+      if (!mounted) return;
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("OTP isn't available on the Public channel."),
         ),
       );
       return;

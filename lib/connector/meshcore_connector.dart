@@ -1059,7 +1059,29 @@ class MeshCoreConnector extends ChangeNotifier {
     return _contactOtpPads[contactKeyHex];
   }
 
+  /// True for the one channel every device on the mesh shares by
+  /// construction (a fixed, well-known PSK - see [Channel.publicChannelPsk]
+  /// - not by name, since a channel's display name is never a reliable
+  /// signal: this one could be renamed, and nothing stops a *different*
+  /// channel from being named "Public" too). False if [channelIndex]
+  /// isn't a currently known channel at all.
+  bool _isPublicChannel(int channelIndex) {
+    return _channels.any(
+      (c) => c.index == channelIndex && c.isPublicChannel,
+    );
+  }
+
+  /// Returns null unconditionally for the Public channel, regardless of
+  /// what's actually sitting in [_channelOtpPads] or on disk - see
+  /// [setChannelOtpPad] for why nothing can ever get OTP-enabled there in
+  /// the first place, but this is the funnel every OTP-channel check in
+  /// this file goes through ([isChannelOtpEnabled], [_dispatchOtpChannel],
+  /// every send path), so gating here is enough to keep the Public channel
+  /// out of OTP everywhere without touching each of those call sites, and
+  /// it also covers a pad that was somehow saved before this restriction
+  /// existed - it's hidden from use, not deleted.
   OtpPad? getChannelOtpPad(int channelIndex) {
+    if (_isPublicChannel(channelIndex)) return null;
     if (!_channelOtpPads.containsKey(channelIndex)) {
       _channelOtpPads[channelIndex] = _otpPadStore.loadChannelPad(
         channelIndex,
@@ -1124,6 +1146,9 @@ class MeshCoreConnector extends ChangeNotifier {
     OtpPadRole role, {
     String? label,
   }) async {
+    if (_isPublicChannel(channelIndex)) {
+      throw OtpPublicChannelBlockedException();
+    }
     final pad = OtpPad(
       padHex: padHex,
       mode: OtpPadMode.sharedSequential,
