@@ -33,16 +33,92 @@ class SignalGrade {
   const SignalGrade(this.label, this.color);
 }
 
-SignalGrade signalGradeForStats(CompanionRadioStats? stats) {
-  if (stats == null) {
-    return const SignalGrade('no data', Color(sigRed));
-  }
-  final margin = stats.lastRssiDbm - stats.noiseFloorDbm;
+/// The raw margin a single stats sample represents, or null when there's
+/// no sample at all - split out from grading so the rolling averager
+/// below (and any test) can work with plain numbers.
+int? marginForStats(CompanionRadioStats? stats) {
+  if (stats == null) return null;
+  return stats.lastRssiDbm - stats.noiseFloorDbm;
+}
+
+/// Thresholds only - unchanged from the original port, and exactly
+/// matching both Lua builds' sig_grade_for_margin.
+SignalGrade gradeForMargin(num margin) {
   if (margin >= 20) return const SignalGrade('excellent', Color(sigGreenBright));
   if (margin >= 12) return const SignalGrade('good', Color(sigGreen));
   if (margin >= 6) return const SignalGrade('fair', Color(sigYellow));
   if (margin >= 0) return const SignalGrade('poor', Color(sigOrange));
   return const SignalGrade('very poor', Color(sigRed));
+}
+
+/// Grades a single sample in isolation, with no smoothing - kept as its
+/// own function (unchanged signature) in case anything wants an
+/// instantaneous reading, but no longer what the indicator widget below
+/// actually displays - see SignalMarginAverager for why.
+SignalGrade signalGradeForStats(CompanionRadioStats? stats) {
+  final margin = marginForStats(stats);
+  if (margin == null) return const SignalGrade('no data', Color(sigRed));
+  return gradeForMargin(margin);
+}
+
+/// Smooths a running series of CompanionRadioStats samples into a rolling
+/// average, mirroring Lua's own sig_history/SIGNAL_HISTORY_LEN exactly
+/// (an 8-sample rolling average) - this indicator was ported with the
+/// intent that "good" means the same thing on both platforms, but the
+/// first version only carried over the five margin thresholds and
+/// missed the averaging that makes that comparison fair in practice.
+///
+/// Without this, the indicator graded whatever the single most recent
+/// BLE stats frame happened to report - and "most recent successfully
+/// parsed frame" skews optimistic on its own (a frame that didn't arrive
+/// cleanly just doesn't update anything, so the display can only ever
+/// move towards whichever readings came through best), on top of one
+/// single sample being far noisier than an 8-sample average to begin
+/// with. Together, that's a plausible explanation for a phone
+/// consistently showing "excellent" while every Lua node on the same
+/// mesh reports "poor": Lua's reading was already an 8-sample average
+/// the whole time, and this one wasn't.
+class SignalMarginAverager {
+  SignalMarginAverager({this.historyLen = 8});
+
+  final int historyLen;
+  final List<int> _history = [];
+  CompanionRadioStats? _lastSeen;
+
+  /// Drops the whole rolling window - call this on disconnect/reconnect
+  /// so a new session (possibly a different companion radio entirely)
+  /// never gets graded against samples left over from a previous one.
+  void reset() {
+    _history.clear();
+    _lastSeen = null;
+  }
+
+  /// Feed the latest known stats (or null) and get back the grade for
+  /// the current rolling average. Safe to call repeatedly with the same
+  /// stats object (e.g. on every widget rebuild) - a sample already in
+  /// the window is never counted twice.
+  SignalGrade update(CompanionRadioStats? stats) {
+    if (stats == null) {
+      _history.clear();
+      _lastSeen = null;
+      return const SignalGrade('no data', Color(sigRed));
+    }
+    if (!identical(stats, _lastSeen)) {
+      _lastSeen = stats;
+      final margin = marginForStats(stats);
+      if (margin != null) {
+        _history.add(margin);
+        if (_history.length > historyLen) {
+          _history.removeAt(0);
+        }
+      }
+    }
+    if (_history.isEmpty) {
+      return const SignalGrade('no data', Color(sigRed));
+    }
+    final avg = _history.reduce((a, b) => a + b) / _history.length;
+    return gradeForMargin(avg);
+  }
 }
 
 IconData iconForSignalGrade(String label) {
@@ -76,6 +152,9 @@ class SignalGradeIndicator extends StatefulWidget {
 
 class _SignalGradeIndicatorState extends State<SignalGradeIndicator> {
   MeshCoreConnector? _connector;
+  // Same 8-sample rolling average Lua's sig_history uses - see
+  // SignalMarginAverager's own comment for why this matters here.
+  final _averager = SignalMarginAverager();
 
   @override
   void initState() {
@@ -98,13 +177,17 @@ class _SignalGradeIndicatorState extends State<SignalGradeIndicator> {
           (connected: c.isConnected, supported: c.supportsCompanionRadioStats),
       builder: (context, state, _) {
         if (!state.connected || !state.supported) {
+          // A stale rolling average from a previous connection (or a
+          // previous companion radio entirely) must never leak into a
+          // later session's reading.
+          _averager.reset();
           return const SizedBox.shrink();
         }
         final connector = context.read<MeshCoreConnector>();
         return ValueListenableBuilder<CompanionRadioStats?>(
           valueListenable: connector.radioStatsNotifier,
           builder: (context, stats, _) {
-            final grade = signalGradeForStats(stats);
+            final grade = _averager.update(stats);
             return Tooltip(
               message: 'Signal: ${grade.label}',
               child: InkWell(
