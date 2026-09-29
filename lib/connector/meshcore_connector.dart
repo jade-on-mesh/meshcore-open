@@ -1451,6 +1451,7 @@ class MeshCoreConnector extends ChangeNotifier {
             isReply: false,
             myOffset: pad.myOffset,
             theirOffset: pad.theirOffset,
+            role: pad.role,
           );
     unawaited(
       sendFrame(
@@ -1560,6 +1561,14 @@ class MeshCoreConnector extends ChangeNotifier {
     if (pad != null &&
         !pad.isSharedSequential &&
         !payload.isSharedSequential) {
+      // Explicit role-verification handshake (wire v3, "z2"): each side now
+      // states its own resolved role directly on the wire, so a same-role
+      // collision (both devices independently resolving to "A", say) can
+      // be caught here directly instead of only being inferred after the
+      // fact from implausible byte-count math. See the matching comment in
+      // OtpSyncPayload/OtpPad.role's own doc comment about why this was
+      // previously an undetectable failure mode.
+      final roleCollision = payload.role != null && payload.role == pad.role;
       final peerMyOffset = payload.myOffset ?? 0;
       final peerTheirOffset = payload.theirOffset ?? 0;
       // In sync iff: what THEY say they've sent (their myOffset) matches
@@ -1570,7 +1579,7 @@ class MeshCoreConnector extends ChangeNotifier {
       // this is a diagnostic signal, not a hard correctness guarantee.
       final drift = pad.theirOffset - peerMyOffset;
       final otherDrift = pad.myOffset - peerTheirOffset;
-      final inSync = drift == 0 && otherDrift == 0;
+      final inSync = !roleCollision && drift == 0 && otherDrift == 0;
       // A genuine, fully-confirmed in-sync (both directions agree, not
       // just "the one direction _maybeAutoResyncContact cares about")
       // clears the repeated-resync streak — only a real recovery should
@@ -1583,18 +1592,27 @@ class MeshCoreConnector extends ChangeNotifier {
             DateTime.now(),
         repliedAt: DateTime.now(),
         inSync: inSync,
-        driftBytes: inSync ? 0 : primaryDrift,
-        driftDirection: inSync
+        driftBytes: (inSync || roleCollision) ? 0 : primaryDrift,
+        driftDirection: (inSync || roleCollision)
             ? null
             : (primaryDrift > 0 ? 'mine-ahead' : 'theirs-ahead'),
+        roleCollision: roleCollision,
       );
+      // A role collision means the counters on each side aren't even
+      // comparable (both parties think they own the same half of the
+      // pad), so any apparent "gap" here is meaningless and must NOT be
+      // used to arm an auto-resync — that would just make things worse.
       // Only ever track/auto-fix the direction this device can safely fix
       // itself: "I'm behind on receiving what they say they've sent"
       // (peerMyOffset > pad.theirOffset). The other mismatch direction
       // (otherDrift) is THEIR receive lag, not fixable from here — it
       // resolves itself on their device via the identical logic once our
       // reply below reaches them.
-      _trackContactResyncGap(contact.publicKeyHex, peerMyOffset);
+      if (!roleCollision) {
+        _trackContactResyncGap(contact.publicKeyHex, peerMyOffset);
+      } else {
+        _pendingContactResync.remove(contact.publicKeyHex);
+      }
     }
     // Real hardware bug found in production: this reply used to fire
     // unconditionally for every original (non-reply) sync-check heard, no
@@ -1614,6 +1632,7 @@ class MeshCoreConnector extends ChangeNotifier {
               isReply: true,
               myOffset: pad.myOffset,
               theirOffset: pad.theirOffset,
+              role: pad.role,
             );
       unawaited(
         sendFrame(

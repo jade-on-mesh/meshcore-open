@@ -38,6 +38,14 @@ class OtpSyncStatus {
   /// this is surfaced in the UI rather than silently absorbed.
   final int? autoResyncedBytes;
 
+  /// True only for a two-party DM pad where the peer's sync-check stated
+  /// the SAME resolved role ("A"/"B") as this device's own — both sides
+  /// think they own the same half of the pad, so the counters aren't even
+  /// comparable and [inSync] is forced false. This is a hard stop, not a
+  /// drift to auto-fix: see `MeshCoreConnector._maybeHandleContactSyncMessage`.
+  /// The affected pad needs to be wiped and re-imported on one device.
+  final bool roleCollision;
+
   const OtpSyncStatus({
     required this.checkedAt,
     this.repliedAt,
@@ -46,6 +54,7 @@ class OtpSyncStatus {
     this.driftBytes,
     this.driftDirection,
     this.autoResyncedBytes,
+    this.roleCollision = false,
   });
 
   /// Still waiting on a reply to a check this device sent.
@@ -59,6 +68,7 @@ class OtpSyncStatus {
     Object? driftBytes = _unset,
     Object? driftDirection = _unset,
     Object? autoResyncedBytes = _unset,
+    bool? roleCollision,
   }) {
     return OtpSyncStatus(
       checkedAt: checkedAt ?? this.checkedAt,
@@ -76,6 +86,7 @@ class OtpSyncStatus {
       autoResyncedBytes: autoResyncedBytes == _unset
           ? this.autoResyncedBytes
           : autoResyncedBytes as int?,
+      roleCollision: roleCollision ?? this.roleCollision,
     );
   }
 

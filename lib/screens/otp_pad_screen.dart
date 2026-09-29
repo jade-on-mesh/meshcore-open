@@ -622,6 +622,12 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
       color = MeshPalette.blue;
       icon = Icons.check_circle_outline;
       text = 'In sync';
+    } else if (status.roleCollision) {
+      color = MeshPalette.alert;
+      icon = Icons.error_outline;
+      text =
+          'Role collision — both devices resolved the same A/B role for '
+          'this pad. Wipe and re-import on one device to fix.';
     } else if (status.inSync == false) {
       color = MeshPalette.alert;
       icon = Icons.warning_amber_rounded;
