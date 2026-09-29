@@ -538,6 +538,30 @@ class MeshCoreConnector extends ChangeNotifier {
   // channelIndex -> senderName -> pending state for that participant.
   final Map<int, Map<String, ({int peerOffset, DateTime firstSeen})>>
   _pendingChannelResync = {};
+  // Found from a real device report: hitting "resync" could drain a DM
+  // pad straight to 0 bytes, then the reply this device sends back would
+  // do the exact same thing to the OTHER side's pad — both ending up
+  // "exhausted" from one resync. _maybeAutoResyncContact previously had
+  // no ceiling at all on how much it would silently auto-consume in one
+  // shot — only an all-or-nothing check (refuse if the WHOLE gap doesn't
+  // fit, otherwise consume the whole gap, however large). A gap that's
+  // merely large (not literally bigger than what's left) sailed straight
+  // through and could eat most or all of a small pad in one call. This is
+  // exactly the failure shape a same-role collision produces (see
+  // resolveDmRole's doc comment on that being undetectable by the
+  // ordinary in-sync check), but the cap below is real protection against
+  // ANY cause of an implausibly large reported gap, not just that one.
+  // _contactResyncStreak counts consecutive auto-resyncs for a contact
+  // with no genuine, fully-confirmed in-sync in between (see
+  // _maybeHandleContactSyncMessage, which resets it to 0 on a real
+  // bidirectional match) — a gap that keeps reappearing after being
+  // "fixed" indicates a persistent mismatch an automatic byte-skip can
+  // never actually resolve, only mask one round at a time while eating
+  // the pad down to nothing.
+  final Map<String, int> _contactResyncStreak = {};
+  static const double _maxAutoResyncFraction = 0.5;
+  static const int _maxAutoResyncAbsBytes = 500;
+  static const int _maxConsecutiveAutoResyncs = 3;
   final Map<String, Timer> _otpResyncTimers = {};
   Timer? _otpAutoSyncPollTimer;
   // Widened from 120s (2min) to 300s (5min), matching the Lua side's
@@ -1199,6 +1223,7 @@ class MeshCoreConnector extends ChangeNotifier {
   void _clearContactSyncState(String contactKeyHex) {
     _contactOtpSyncStatus.remove(contactKeyHex);
     _pendingContactResync.remove(contactKeyHex);
+    _contactResyncStreak.remove(contactKeyHex);
     _otpResyncTimers.remove('rc:$contactKeyHex')?.cancel();
     _otpSyncTimeoutTimers.remove('c:$contactKeyHex')?.cancel();
     _lastPromptSyncCheckAt.remove('c:$contactKeyHex');
@@ -1546,6 +1571,11 @@ class MeshCoreConnector extends ChangeNotifier {
       final drift = pad.theirOffset - peerMyOffset;
       final otherDrift = pad.myOffset - peerTheirOffset;
       final inSync = drift == 0 && otherDrift == 0;
+      // A genuine, fully-confirmed in-sync (both directions agree, not
+      // just "the one direction _maybeAutoResyncContact cares about")
+      // clears the repeated-resync streak — only a real recovery should
+      // reset it, not merely receiving another sync-check.
+      if (inSync) _contactResyncStreak.remove(contact.publicKeyHex);
       final primaryDrift = drift != 0 ? drift : otherDrift;
       _contactOtpSyncStatus[contact.publicKeyHex] = OtpSyncStatus(
         checkedAt:
@@ -1745,9 +1775,46 @@ class MeshCoreConnector extends ChangeNotifier {
     // its own.
     final gap = pending.peerOffset - pad.theirOffset;
     if (gap <= 0) {
+      _contactResyncStreak.remove(contactKeyHex);
       return; // caught up on its own - nothing left to fix
     }
+    if ((_contactResyncStreak[contactKeyHex] ?? 0) >=
+        _maxConsecutiveAutoResyncs) {
+      _contactOtpSyncStatus[contactKeyHex] =
+          (_contactOtpSyncStatus[contactKeyHex] ??
+                  OtpSyncStatus(checkedAt: DateTime.now()))
+              .copyWith(
+                inSync: false,
+                driftBytes: gap,
+                driftDirection: 'theirs-ahead',
+              );
+      notifyListeners();
+      return;
+    }
     if (pad.theirBytesRemaining < gap) {
+      _contactOtpSyncStatus[contactKeyHex] =
+          (_contactOtpSyncStatus[contactKeyHex] ??
+                  OtpSyncStatus(checkedAt: DateTime.now()))
+              .copyWith(
+                inSync: false,
+                driftBytes: gap,
+                driftDirection: 'theirs-ahead',
+              );
+      notifyListeners();
+      return;
+    }
+    // A gap is only auto-fixed up to a bounded ceiling (half of what's
+    // actually left, capped at _maxAutoResyncAbsBytes) — a gap bigger
+    // than that almost certainly means something is structurally wrong
+    // (role mismatch, corrupted counters) rather than "missed a couple
+    // of messages", and blindly paying it out of irreplaceable pad bytes
+    // is the wrong response. See the field doc on _contactResyncStreak
+    // above for the full reasoning.
+    final cap = math.min(
+      (pad.theirBytesRemaining * _maxAutoResyncFraction).floor(),
+      _maxAutoResyncAbsBytes,
+    );
+    if (gap > cap) {
       _contactOtpSyncStatus[contactKeyHex] =
           (_contactOtpSyncStatus[contactKeyHex] ??
                   OtpSyncStatus(checkedAt: DateTime.now()))
@@ -1762,6 +1829,8 @@ class MeshCoreConnector extends ChangeNotifier {
     final updated = pad.copyWith(theirOffset: pad.theirOffset + gap);
     _contactOtpPads[contactKeyHex] = updated;
     unawaited(_otpPadStore.saveContactPad(contactKeyHex, updated));
+    _contactResyncStreak[contactKeyHex] =
+        (_contactResyncStreak[contactKeyHex] ?? 0) + 1;
     _contactOtpSyncStatus[contactKeyHex] = OtpSyncStatus(
       checkedAt: DateTime.now(),
       repliedAt: DateTime.now(),
