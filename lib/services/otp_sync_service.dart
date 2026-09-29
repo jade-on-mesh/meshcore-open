@@ -18,10 +18,10 @@ import '../models/otp_pad.dart';
 /// there either).
 ///
 /// Wire layout (v3, all ASCII):
-///   `z2p<role><myOffset36>:<theirOffset36>`   (two-party pad, initial check)
-///   `z2P<role><myOffset36>:<theirOffset36>`   (two-party pad, reply)
-///   `z2s<offset36>`                            (shared/channel pad, initial check)
-///   `z2S<offset36>`                            (shared/channel pad, reply)
+///   `z3p<role><myOffset36>:<theirOffset36>`   (two-party pad, initial check)
+///   `z3P<role><myOffset36>:<theirOffset36>`   (two-party pad, reply)
+///   `z3s<offset36>`                            (shared/channel pad, initial check)
+///   `z3S<offset36>`                            (shared/channel pad, reply)
 /// where `<N36>` is N encoded in base 36 (`0-9a-z`), lowercase on send,
 /// accepted case-insensitively on receive, and `<role>` is a single `A`/`B`
 /// character: the sender's own resolved [OtpPadRole] for this two-party pad
@@ -38,7 +38,7 @@ import '../models/otp_pad.dart';
 /// independently resolving to "A", say) was undetectable by the counter
 /// check alone; now each side states its role directly on the wire, so a
 /// collision can be caught explicitly the moment it's seen, instead of only
-/// being inferred after the fact from implausible byte-count math. `z1`/`z2`
+/// being inferred after the fact from implausible byte-count math. `z1`/`z3`
 /// is the format-version tag (bump again if the payload shape ever needs to
 /// change further, so old and new builds can tell each other's messages
 /// apart instead of silently misparsing them) — chosen because it can't
@@ -48,6 +48,18 @@ import '../models/otp_pad.dart';
 /// change from v2 — every device sharing a pad needs the matching build at
 /// the same time; a v2 and a v3 peer cannot sync-check with each other at
 /// all (the marker itself won't match).
+///
+/// NOTE: this was originally shipped with marker `z2`, which collides with
+/// [OtpChannelOffsetService.marker] (also `z2`, already in use by the
+/// channel-collision-detection feature that wraps every real channel
+/// ciphertext message). Since `_maybeHandleChannelSyncMessage` is checked
+/// before channel ciphertext is unwrapped in `MeshCoreConnector`, every real
+/// channel message got misrouted into this sync-check parser and silently
+/// swallowed instead of ever being decrypted — the receiving side's channel
+/// counter could never advance, and users saw pad-draining auto-resyncs
+/// trying (and failing) to close a gap that real traffic kept silently
+/// reopening. Renamed to `z3` to stop colliding; `OtpChannelOffsetService`
+/// keeps its original, field-confirmed `z2`.
 ///
 /// `replyFlag` (the letter case) is initial for the message that triggers a
 /// check and reply for the automatic reply it provokes — receiving a reply
@@ -95,7 +107,7 @@ class OtpSyncPayload {
 class OtpSyncService {
   OtpSyncService._();
 
-  static const String marker = 'z2';
+  static const String marker = 'z3';
 
   static String buildTwoParty({
     required bool isReply,

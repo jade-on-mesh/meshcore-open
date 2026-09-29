@@ -1561,7 +1561,7 @@ class MeshCoreConnector extends ChangeNotifier {
     if (pad != null &&
         !pad.isSharedSequential &&
         !payload.isSharedSequential) {
-      // Explicit role-verification handshake (wire v3, "z2"): each side now
+      // Explicit role-verification handshake (wire v3, "z3"): each side now
       // states its own resolved role directly on the wire, so a same-role
       // collision (both devices independently resolving to "A", say) can
       // be caught here directly instead of only being inferred after the
