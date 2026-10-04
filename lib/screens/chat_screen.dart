@@ -1725,6 +1725,19 @@ class _MessageBubble extends StatelessWidget {
     final settingsService = context.watch<AppSettingsService>();
     final enableTracing = settingsService.settings.enableMessageTracing;
     final isOutgoing = message.isOutgoing;
+    // Request: in OTP mode, own messages sit on the LEFT and the other
+    // party's on the RIGHT - the mirror of the usual layout - matching the
+    // identical flip in OTP_3_RC1.lua's chat screen. Only the SIDE a
+    // bubble is drawn on flips; isOutgoing itself (and everything below
+    // that's about identity rather than position - bubbleColor/
+    // bubbleBorder/textColor, whether the sender's name is shown, retry/
+    // status-tick visibility, trip-time coloring) stays tied to who
+    // actually sent the message, so a bubble's color and content still
+    // always mean "mine" regardless of which side it ends up on.
+    final otpActive = context.select<MeshCoreConnector, bool>(
+      (connector) => connector.isContactOtpEnabled(sourceId),
+    );
+    final layoutOutgoing = otpActive ? !isOutgoing : isOutgoing;
     final scheme = Theme.of(context).colorScheme;
     final gifId = GifHelper.parseGif(message.text);
     // An OTP DM image (see otp_image_transport.dart) posts its message with
@@ -1762,7 +1775,9 @@ class _MessageBubble extends StatelessWidget {
     const bodyFontSize = 14.0;
 
     // Asymmetric radius: outgoing — top-left large, others also large; outgoing bottom-right tight.
-    final borderRadius = isOutgoing
+    // Follows layoutOutgoing (not isOutgoing) - the tight "tail" corner
+    // should point toward whichever edge the bubble is actually drawn at.
+    final borderRadius = layoutOutgoing
         ? const BorderRadius.only(
             topLeft: Radius.circular(MeshRadii.lg),
             topRight: Radius.circular(MeshRadii.lg),
@@ -1818,7 +1833,7 @@ class _MessageBubble extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Column(
-        crossAxisAlignment: isOutgoing
+        crossAxisAlignment: layoutOutgoing
             ? CrossAxisAlignment.end
             : CrossAxisAlignment.start,
         children: [
@@ -1829,12 +1844,12 @@ class _MessageBubble extends StatelessWidget {
                   ? (_) => onLongPress?.call()
                   : null,
               child: Row(
-                mainAxisAlignment: isOutgoing
+                mainAxisAlignment: layoutOutgoing
                     ? MainAxisAlignment.end
                     : MainAxisAlignment.start,
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  if (!isOutgoing) ...[
+                  if (!layoutOutgoing) ...[
                     _buildAvatar(senderName),
                     const SizedBox(width: 6),
                   ],
@@ -1935,7 +1950,7 @@ class _MessageBubble extends StatelessWidget {
                                           vertical: 4,
                                         ),
                                         child: Align(
-                                          alignment: isOutgoing
+                                          alignment: layoutOutgoing
                                               ? Alignment.centerRight
                                               : Alignment.centerLeft,
                                           child: MessageUrlImagePreview(
@@ -2121,7 +2136,7 @@ class _MessageBubble extends StatelessWidget {
           if (message.reactions.isNotEmpty) ...[
             const SizedBox(height: 4),
             Padding(
-              padding: EdgeInsets.only(left: isOutgoing ? 0 : 42),
+              padding: EdgeInsets.only(left: layoutOutgoing ? 0 : 42),
               child: _buildReactionsDisplay(context, message, scheme),
             ),
           ],

@@ -772,6 +772,16 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     final settingsService = context.watch<AppSettingsService>();
     final enableTracing = settingsService.settings.enableMessageTracing;
     final isOutgoing = message.isOutgoing;
+    // In an OTP-active channel, bubble SIDE is mirrored (own messages on the
+    // left, others' on the right) so an OTP conversation reads visually
+    // distinct from a normal one; everything about a message's real
+    // identity (color, sender-name visibility, status ticks, swipe-to-reply
+    // eligibility) stays keyed to isOutgoing. See _MessageBubble in
+    // chat_screen.dart for the DM-side twin of this.
+    final otpActive = context.select<MeshCoreConnector, bool>(
+      (connector) => connector.isChannelOtpEnabled(widget.channel.index),
+    );
+    final layoutOutgoing = otpActive ? !isOutgoing : isOutgoing;
     final scheme = Theme.of(context).colorScheme;
     final gifId = GifHelper.parseGif(message.text);
     final poi = parseMarkerText(message.text);
@@ -840,7 +850,7 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     }
 
     // Asymmetric radius matching chat_screen bubbles.
-    final borderRadius = isOutgoing
+    final borderRadius = layoutOutgoing
         ? const BorderRadius.only(
             topLeft: Radius.circular(MeshRadii.lg),
             topRight: Radius.circular(MeshRadii.lg),
@@ -858,17 +868,17 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     const replySwipeThreshold = 64.0;
     final messageBody = LayoutBuilder(
       builder: (context, constraints) => Column(
-        crossAxisAlignment: isOutgoing
+        crossAxisAlignment: layoutOutgoing
             ? CrossAxisAlignment.end
             : CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: isOutgoing
+            mainAxisAlignment: layoutOutgoing
                 ? MainAxisAlignment.end
                 : MainAxisAlignment.start,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (!isOutgoing) ...[
+              if (!layoutOutgoing) ...[
                 _buildAvatar(message.senderName, textScale),
                 const SizedBox(width: 6),
               ],
@@ -960,7 +970,7 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
                                         vertical: 4,
                                       ),
                                       child: Align(
-                                        alignment: isOutgoing
+                                        alignment: layoutOutgoing
                                             ? Alignment.centerRight
                                             : Alignment.centerLeft,
                                         child: MessageUrlImagePreview(
@@ -1132,7 +1142,7 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
           if (message.reactions.isNotEmpty) ...[
             const SizedBox(height: 4),
             Padding(
-              padding: EdgeInsets.only(left: isOutgoing ? 0 : 42),
+              padding: EdgeInsets.only(left: layoutOutgoing ? 0 : 42),
               child: _buildReactionsDisplay(message),
             ),
           ],
@@ -1775,18 +1785,23 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
   Widget _buildImageBubble(ReceivedImageEntry entry, double textScale) {
     final scheme = Theme.of(context).colorScheme;
     final isOutgoing = entry.isOutgoing;
+    // Same OTP-mode side-mirroring as _buildMessageBubble above.
+    final otpActive = context.select<MeshCoreConnector, bool>(
+      (connector) => connector.isChannelOtpEnabled(widget.channel.index),
+    );
+    final layoutOutgoing = otpActive ? !isOutgoing : isOutgoing;
     final textColor = isOutgoing ? MeshPalette.meInk : scheme.onSurface;
     final metaColor = textColor.withValues(alpha: 0.65);
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Row(
-        mainAxisAlignment: isOutgoing
+        mainAxisAlignment: layoutOutgoing
             ? MainAxisAlignment.end
             : MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          if (!isOutgoing) ...[
+          if (!layoutOutgoing) ...[
             _buildAvatar(_imageSenderLabel(entry), textScale),
             const SizedBox(width: 6),
           ],
