@@ -109,6 +109,28 @@ class OtpSyncService {
 
   static const String marker = 'z3';
 
+  /// Markers used by earlier wire-format generations, kept here ONLY so a
+  /// stale peer's old-format sync-check chatter is still recognized and
+  /// suppressed from chat display by [looksLikeSyncMessage], even though
+  /// this build can't actually parse or act on it ([parse] still only ever
+  /// matches [marker] — see the real-world report below). Without this, an
+  /// up-to-date device sees a message it doesn't recognize as a control
+  /// message at all, and it falls straight through to the chat view as
+  /// literal garbage ("z1sak", "z1sao", ...) — reported from CascadiaMesh
+  /// field testing where one device had gone a while without an update.
+  ///
+  /// Deliberately does NOT include the transient 'z2' this marker held for
+  /// one patch, between the role-handshake bump and the very next one that
+  /// moved it again to 'z3' - 'z2' is ALSO (and permanently)
+  /// [OtpChannelOffsetService]'s channel-offset marker, so treating it as a
+  /// legacy sync marker here would misidentify real channel ciphertext
+  /// (which legitimately starts with 'z2' too) as sync-check control
+  /// chatter and silently drop it from the chat entirely - a worse bug
+  /// (losing a real message) than the display leak this list is fixing.
+  /// 'OTPSYNC1|' is the original v1 pipe-delimited format, from before any
+  /// single-letter marker existed.
+  static const List<String> _legacyMarkers = ['z1', 'OTPSYNC1|'];
+
   static String buildTwoParty({
     required bool isReply,
     required int myOffset,
@@ -126,8 +148,15 @@ class OtpSyncService {
 
   /// Cheap pre-check before bothering to [parse] — also what
   /// `prepareContactOutboundText`/`prepareChannelOutboundText` use to keep
-  /// Smaz/Cyr2Lat from touching an outgoing sync-check message.
-  static bool looksLikeSyncMessage(String text) => text.startsWith(marker);
+  /// Smaz/Cyr2Lat from touching an outgoing sync-check message. Recognizes
+  /// the current wire format and known-safe legacy ones (see
+  /// [_legacyMarkers]) so old-format control chatter from a stale peer is
+  /// always hidden from chat, never shown as garbage text. [parse] still
+  /// only ever succeeds against [marker], so a legacy-marker message always
+  /// resolves to "suppress, nothing actionable" - its already-documented
+  /// null-parse behavior - never to a real (mis-)parsed sync exchange.
+  static bool looksLikeSyncMessage(String text) =>
+      text.startsWith(marker) || _legacyMarkers.any(text.startsWith);
 
   /// Parses a message already known to start with [marker]. Returns null
   /// for anything malformed — callers should still treat a null result as
