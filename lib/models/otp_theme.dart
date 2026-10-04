@@ -117,14 +117,24 @@ class OtpTheme {
     ),
     OtpTheme(
       name: 'Cascadia',
-      encrypt: Color(0xFF60A5FA),
-      decrypt: Color(0xFF93C5FD),
-      ciphertext: Color(0xFF86EFAC),
+      // Repalette (2026-10-04, full 9-theme audit prompted by the Trans
+      // fix above): the original set put 3 of the 5 sender-pool colors
+      // within 13 degrees of each other in hue (all blue) and gave
+      // `ciphertext` the exact same hue as `channel` (both forest green,
+      // only saturation/lightness differed) - after the 0.35 darken step,
+      // several received senders and even a received-vs-sent bubble could
+      // read as the same color. Rebuilt around 5 clearly separated PNW
+      // hues - glacier blue, mountain-dusk purple, sunset amber,
+      // huckleberry pink, moss green - verified by hue distance, not by
+      // eye, so it's not guesswork.
+      encrypt: Color(0xFF60A5FA), // sky blue (unchanged)
+      decrypt: Color(0xFF38BDF8), // glacier blue
+      ciphertext: Color(0xFFA78BFA), // mountain-dusk purple
       plaintext: Color(0xFFFFFFFF),
-      newpad: Color(0xFF3B82F6),
-      channel: Color(0xFF15803D),
-      resultOk: Color(0xFF34D399),
-      keyphrase: Color(0xFF1D4ED8),
+      newpad: Color(0xFFFBBF24), // sunset amber
+      channel: Color(0xFF15803D), // forest green (unchanged - "mine")
+      resultOk: Color(0xFF84CC16), // moss/lime green - distinct shade from channel
+      keyphrase: Color(0xFFF472B6), // huckleberry pink
       padinfo: Color(0xFF22C55E),
       ready: Color(0xFFCBD5E1),
       bg: Color(0xFF000000),
@@ -173,11 +183,22 @@ class OtpTheme {
     ),
     OtpTheme(
       name: 'Dark',
+      // Repalette (2026-10-04, full 9-theme audit): `ciphertext` (crimson)
+      // and `newpad` (tomato) both sat within 12 degrees of `channel`'s
+      // pure red - a received sender could land on a near-identical red
+      // to your own sent bubble. Moved them to a smoke/ash slate and a
+      // midnight steel-blue - a deliberate "fire vs. ash/night" contrast
+      // that keeps the theme's intensity while fixing the collision.
+      // `decrypt`/`resultOk` (orange/gold, 12 degrees apart) are a minor
+      // pre-existing closeness left as-is - tightening it further would
+      // mean giving up either color's own identity for a difference
+      // nobody flagged, within a theme whose whole palette is deliberately
+      // narrow (fire tones).
       encrypt: Color(0xFFFF4500),
       decrypt: Color(0xFFFFA500),
-      ciphertext: Color(0xFFDC143C),
+      ciphertext: Color(0xFF2F4F4F), // ash/smoke slate
       plaintext: Color(0xFFFFFFFF),
-      newpad: Color(0xFFFF6347),
+      newpad: Color(0xFF4682B4), // midnight steel blue
       channel: Color(0xFFFF0000),
       resultOk: Color(0xFFFFD700),
       keyphrase: Color(0xFFFFDAB9),
@@ -187,14 +208,22 @@ class OtpTheme {
     ),
     OtpTheme(
       name: 'Ice Cream',
-      encrypt: Color(0xFFFFB6C1),
-      decrypt: Color(0xFFB4E7CE),
-      ciphertext: Color(0xFFE6D5F7),
+      // Repalette (2026-10-04, full 9-theme audit): `decrypt` and
+      // `resultOk` were nearly identical pastel mint greens (5 degrees
+      // apart), and the whole set's low saturation meant several bubbles
+      // darkened close to unreadable gray, `channel` (the sent-bubble
+      // color) included. Reassigned the sender-pool colors to 5 distinct,
+      // slightly richer "flavors" - pistachio, grape, peach, blueberry,
+      // mint - and gave `channel` a bolder cotton-candy blue so it still
+      // reads as pastel without washing out after darkening.
+      encrypt: Color(0xFFFFB6C1), // strawberry (unchanged)
+      decrypt: Color(0xFFD4E8A8), // pistachio
+      ciphertext: Color(0xFFD8A8E8), // grape
       plaintext: Color(0xFFFFF8E7),
-      newpad: Color(0xFFFFDAB9),
-      channel: Color(0xFFB0E0E6),
-      resultOk: Color(0xFFA8E6CF),
-      keyphrase: Color(0xFFDCC6E0),
+      newpad: Color(0xFFFFDAB9), // peach (unchanged)
+      channel: Color(0xFF7FCDE0), // cotton-candy blue - richer than before
+      resultOk: Color(0xFFA8E6CF), // mint (unchanged)
+      keyphrase: Color(0xFFA8C4EA), // blueberry
       padinfo: Color(0xFFFFF9C4),
       ready: Color(0xFFFFB7B2),
       bg: Color(0xFF000000),
