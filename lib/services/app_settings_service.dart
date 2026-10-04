@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import '../models/app_settings.dart';
 import '../models/image_codec_support.dart';
+import '../models/otp_theme.dart';
 import '../models/translation_support.dart';
 import '../storage/prefs_manager.dart';
 import '../utils/app_logger.dart';
@@ -67,6 +68,14 @@ class AppSettingsService extends ChangeNotifier {
 
   Future<void> setClearPathOnMaxRetry(bool value) async {
     await updateSettings(_settings.copyWith(clearPathOnMaxRetry: value));
+  }
+
+  /// index into [OtpTheme.all] - validated/clamped here so a stored index
+  /// from a build with more themes than this one never goes out of range.
+  Future<void> setOtpThemeIndex(int value) async {
+    final maxIndex = OtpTheme.all.length - 1;
+    final clamped = value < 0 ? 0 : (value > maxIndex ? maxIndex : value);
+    await updateSettings(_settings.copyWith(otpThemeIndex: clamped));
   }
 
   Future<void> setMapShowRepeaters(bool value) async {

@@ -9,8 +9,11 @@ import '../models/channel.dart';
 import '../models/contact.dart';
 import '../models/otp_pad.dart';
 import '../models/otp_sync_status.dart';
+import '../models/otp_theme.dart';
+import '../services/app_settings_service.dart';
 import '../services/otp_service.dart';
 import '../theme/mesh_theme.dart';
+import '../theme/otp_bubble_colors.dart';
 import '../widgets/adaptive_app_bar_title.dart';
 import '../widgets/mesh_ui.dart';
 import '../widgets/qr_code_display.dart';
@@ -159,6 +162,8 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
             padding: const EdgeInsets.only(bottom: 32),
             children: [
               _buildHeroCard(context, connector, pad),
+              const SectionHeader('Chat theme'),
+              _buildThemeCard(context),
               if (pad != null) ...[
                 const SectionHeader('Pad usage'),
                 _buildUsageCard(context, connector, pad),
@@ -724,6 +729,91 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
         ],
       ),
     );
+  }
+
+  // ── Chat theme (one global choice, same set as OTP_3_RC1.lua's Themes
+  // screen - every OTP-active chat uses it, not just this contact/channel) ──
+
+  Widget _buildThemeCard(BuildContext context) {
+    final settingsService = context.watch<AppSettingsService>();
+    final theme = OtpTheme.all[settingsService.settings.otpThemeIndex];
+    return MeshCard(
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: _buildThemeSwatch(theme),
+        title: Text(theme.name),
+        subtitle: const Text(
+          'Bubble colors for every OTP-active chat — not just this one',
+        ),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: () => _showThemePicker(context, settingsService),
+      ),
+    );
+  }
+
+  /// A handful of dots from the palette's most visible roles — sent
+  /// (outgoing), delivered, failed, retrying — enough to tell themes apart
+  /// at a glance without redrawing a whole mock chat.
+  Widget _buildThemeSwatch(OtpTheme theme) {
+    final dots = [
+      theme.channel,
+      theme.resultOk,
+      theme.encrypt,
+      theme.keyphrase,
+    ];
+    return SizedBox(
+      width: 40,
+      height: 40,
+      child: Wrap(
+        spacing: 2,
+        runSpacing: 2,
+        children: [
+          for (final c in dots)
+            Container(
+              width: 17,
+              height: 17,
+              decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showThemePicker(
+    BuildContext context,
+    AppSettingsService settingsService,
+  ) async {
+    final currentIndex = settingsService.settings.otpThemeIndex;
+    final selected = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+              child: Text(
+                'OTP bubble theme',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+              ),
+            ),
+            for (var i = 0; i < OtpTheme.all.length; i++)
+              ListTile(
+                leading: _buildThemeSwatch(OtpTheme.all[i]),
+                title: Text(OtpTheme.all[i].name),
+                trailing: i == currentIndex
+                    ? const Icon(Icons.check, color: MeshPalette.me)
+                    : null,
+                onTap: () => Navigator.of(sheetContext).pop(i),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (selected != null) {
+      await settingsService.setOtpThemeIndex(selected);
+    }
   }
 
   // ── Setup card (no pad yet) ─────────────────────────────────────────

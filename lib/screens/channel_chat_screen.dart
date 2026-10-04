@@ -26,6 +26,7 @@ import '../l10n/l10n.dart';
 import '../models/channel.dart';
 import '../models/channel_message.dart';
 import '../models/image_codec_support.dart' show aeicRatePointForUi;
+import '../models/otp_theme.dart';
 import '../models/translation_support.dart';
 import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
@@ -54,6 +55,7 @@ import '../widgets/sync_progress_overlay.dart';
 import '../widgets/translated_message_content.dart';
 import '../widgets/unread_divider.dart';
 import '../theme/mesh_theme.dart';
+import '../theme/otp_bubble_colors.dart';
 import '../widgets/mesh_ui.dart';
 import 'app_settings_screen.dart';
 import 'channel_message_path_screen.dart';
@@ -811,14 +813,35 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
       message.pathLength,
     );
 
-    // Bubble colors — outgoing uses MeshPalette.me / meBorder / meInk.
-    final bubbleColor = isOutgoing
-        ? MeshPalette.me
-        : scheme.surfaceContainerLow;
-    final bubbleBorder = isOutgoing
-        ? MeshPalette.meBorder
-        : scheme.outlineVariant;
-    final textColor = isOutgoing ? MeshPalette.meInk : scheme.onSurface;
+    // Bubble colors — outgoing uses MeshPalette.me / meBorder / meInk,
+    // unless OTP is active for this channel: then every bubble is colored
+    // by the chosen OTP theme and the message's own state — same mapping
+    // as chat_screen.dart's DM bubble, minus the delivered/waiting/retry
+    // states a channel broadcast never has (ChannelMessageStatus has no
+    // equivalent - see otp_bubble_colors.dart).
+    final otpColors = otpActive
+        ? (isOutgoing
+              ? otpOutgoingBubbleColors(
+                  theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  failed: message.status == ChannelMessageStatus.failed,
+                  pending: message.status == ChannelMessageStatus.pending,
+                )
+              : otpReceivedBubbleColors(
+                  theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  senderName: message.senderName,
+                  failed: message.status == ChannelMessageStatus.failed,
+                ))
+        : null;
+
+    final bubbleColor =
+        otpColors?.fill ??
+        (isOutgoing ? MeshPalette.me : scheme.surfaceContainerLow);
+    final bubbleBorder =
+        otpColors?.outline ??
+        (isOutgoing ? MeshPalette.meBorder : scheme.outlineVariant);
+    final textColor =
+        otpColors?.text ??
+        (isOutgoing ? MeshPalette.meInk : scheme.onSurface);
     final metaColor = textColor.withValues(alpha: 0.65);
     const bodyFontSize = 14.0;
 
@@ -1790,7 +1813,30 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
       (connector) => connector.isChannelOtpEnabled(widget.channel.index),
     );
     final layoutOutgoing = otpActive ? !isOutgoing : isOutgoing;
-    final textColor = isOutgoing ? MeshPalette.meInk : scheme.onSurface;
+    // Same OTP-theme recoloring as _buildMessageBubble above. An AEIC
+    // image's state machine (receiving/decoding/decoded/...) has no
+    // delivered/retrying/waiting equivalent to carry over, so this only
+    // distinguishes sent (outgoing) from failed-to-reassemble-or-decode.
+    final otpTheme = otpActive
+        ? OtpTheme.all[context
+              .watch<AppSettingsService>()
+              .settings
+              .otpThemeIndex]
+        : null;
+    final otpColors = otpTheme == null
+        ? null
+        : (isOutgoing
+              ? otpOutgoingBubbleColors(theme: otpTheme)
+              : otpReceivedBubbleColors(
+                  theme: otpTheme,
+                  senderName: _imageSenderLabel(entry),
+                  failed:
+                      entry.state == ReceivedImageState.failedIncomplete ||
+                      entry.state == ReceivedImageState.failedCorrupt,
+                ));
+    final textColor =
+        otpColors?.text ??
+        (isOutgoing ? MeshPalette.meInk : scheme.onSurface);
     final metaColor = textColor.withValues(alpha: 0.65);
 
     return Padding(
@@ -1809,12 +1855,16 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
             child: Container(
               padding: const EdgeInsets.all(4),
               decoration: BoxDecoration(
-                color: isOutgoing ? MeshPalette.me : scheme.surfaceContainerLow,
+                color:
+                    otpColors?.fill ??
+                    (isOutgoing ? MeshPalette.me : scheme.surfaceContainerLow),
                 borderRadius: BorderRadius.circular(MeshRadii.lg),
                 border: Border.all(
-                  color: isOutgoing
-                      ? MeshPalette.meBorder
-                      : scheme.outlineVariant,
+                  color:
+                      otpColors?.outline ??
+                      (isOutgoing
+                          ? MeshPalette.meBorder
+                          : scheme.outlineVariant),
                   width: 1,
                 ),
               ),

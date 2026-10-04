@@ -28,6 +28,7 @@ import '../models/contact.dart';
 import '../l10n/contact_localization.dart';
 import '../models/image_codec_support.dart' show aeicRatePointForUi;
 import '../models/message.dart';
+import '../models/otp_theme.dart';
 import '../models/translation_support.dart';
 import '../services/app_settings_service.dart';
 import '../services/chat_text_scale_service.dart';
@@ -39,6 +40,7 @@ import '../services/path_history_service.dart';
 import '../services/received_image_store.dart';
 import '../services/translation_service.dart';
 import '../theme/mesh_theme.dart';
+import '../theme/otp_bubble_colors.dart';
 import '../widgets/chat_zoom_wrapper.dart';
 import '../widgets/byte_count_input.dart';
 import 'app_settings_screen.dart';
@@ -1755,22 +1757,54 @@ class _MessageBubble extends StatelessWidget {
       (connector) => connector.isContactUrlImagesEnabled(sourceId),
     );
 
-    // Bubble colors — outgoing uses MeshPalette.me / meBorder / meInk.
-    final bubbleColor = isFailed
-        ? scheme.errorContainer
-        : isOutgoing
-        ? MeshPalette.me
-        : scheme.surfaceContainerLow;
-    final bubbleBorder = isFailed
-        ? scheme.error
-        : isOutgoing
-        ? MeshPalette.meBorder
-        : scheme.outlineVariant;
-    final textColor = isFailed
-        ? scheme.onErrorContainer
-        : isOutgoing
-        ? MeshPalette.meInk
-        : scheme.onSurface;
+    // Bubble colors — outgoing uses MeshPalette.me / meBorder / meInk,
+    // unless OTP is active for this contact: then every bubble is colored
+    // by the chosen OTP theme and the message's own state (sent/delivered/
+    // retrying/waiting/failed on the outgoing side, or the sender's own
+    // assigned color on the incoming side) — ported from OTP_3_RC1.lua's
+    // refresh_chat_view, see otp_bubble_colors.dart.
+    final otpColors = otpActive
+        ? (isOutgoing
+              ? otpOutgoingBubbleColors(
+                  theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  failed: isFailed,
+                  delivered: message.status == MessageStatus.delivered,
+                  waiting: message.status == MessageStatus.waiting,
+                  retrying:
+                      !isFailed &&
+                      message.status != MessageStatus.delivered &&
+                      message.status != MessageStatus.waiting &&
+                      message.retryCount > 0,
+                  pending: message.status == MessageStatus.pending,
+                )
+              : otpReceivedBubbleColors(
+                  theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  senderName: senderName,
+                  failed: isFailed,
+                ))
+        : null;
+
+    final bubbleColor =
+        otpColors?.fill ??
+        (isFailed
+            ? scheme.errorContainer
+            : isOutgoing
+            ? MeshPalette.me
+            : scheme.surfaceContainerLow);
+    final bubbleBorder =
+        otpColors?.outline ??
+        (isFailed
+            ? scheme.error
+            : isOutgoing
+            ? MeshPalette.meBorder
+            : scheme.outlineVariant);
+    final textColor =
+        otpColors?.text ??
+        (isFailed
+            ? scheme.onErrorContainer
+            : isOutgoing
+            ? MeshPalette.meInk
+            : scheme.onSurface);
     final metaColor = textColor.withValues(alpha: 0.65);
     const bodyFontSize = 14.0;
 
