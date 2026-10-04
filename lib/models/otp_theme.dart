@@ -91,14 +91,26 @@ class OtpTheme {
     ),
     OtpTheme(
       name: 'Trans',
-      encrypt: Color(0xFFF5A9B8),
-      decrypt: Color(0xFF5BCEFA),
-      ciphertext: Color(0xFFFF8FAB),
+      // Repalette (2026-10-04): the original pastel set (F9A8D4/FF8FAB/
+      // FBCFE8 "pinks", BAE6FD/7DD3FC "blues") looked washed out even
+      // before darkening, and the 0.32-0.35 darken factor every bubble
+      // fill goes through (see otp_bubble_colors.dart/refresh_chat_view)
+      // turned them nearly unrecognizable - a muddy maroon-brown instead
+      // of pink, near-black instead of blue. Now built from exactly 4
+      // colors: light blue, light pink, hot pink, lighter blue - hot pink
+      // is reserved for `channel` (the everyday sent-message color) and
+      // deliberately excluded from the sender round-robin pool
+      // (senderColorFields = decrypt/ciphertext/newpad/keyphrase/
+      // resultOk), so a sent bubble's color is never also a received
+      // sender's color.
+      encrypt: Color(0xFFF5A9B8), // light pink
+      decrypt: Color(0xFF5BCEFA), // light blue
+      ciphertext: Color(0xFFF5A9B8), // light pink
       plaintext: Color(0xFFFFFFFF),
-      newpad: Color(0xFF7DD3FC),
-      channel: Color(0xFFF9A8D4),
-      resultOk: Color(0xFFBAE6FD),
-      keyphrase: Color(0xFFFBCFE8),
+      newpad: Color(0xFFA6E8FF), // lighter blue
+      channel: Color(0xFFFF69B4), // hot pink
+      resultOk: Color(0xFF5BCEFA), // light blue
+      keyphrase: Color(0xFFF5A9B8), // light pink
       padinfo: Color(0xFF38BDF8),
       ready: Color(0xFFE5E7EB),
       bg: Color(0xFF000000),
