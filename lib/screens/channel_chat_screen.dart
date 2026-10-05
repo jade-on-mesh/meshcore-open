@@ -731,13 +731,17 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
     if (pad == null) return const SizedBox.shrink();
     final remaining = pad.myBytesRemaining;
     final scheme = Theme.of(context).colorScheme;
+    // Text matches Lua's refresh_chat_bytes() byte-for-byte ("%d bytes
+    // available" + " - pad exhausted"/" - running low") so a screenshot from
+    // either app reads identically — see the matching note in
+    // chat_screen.dart's _buildPadStatusBar.
     final String label;
     final Color color;
     if (remaining <= 0) {
-      label = 'Pad exhausted — import a new one to keep sending';
+      label = '$remaining bytes available - pad exhausted';
       color = scheme.error;
     } else if (remaining < _padLowBytesThreshold) {
-      label = '$remaining bytes available — running low';
+      label = '$remaining bytes available - running low';
       color = scheme.tertiary;
     } else {
       label = '$remaining bytes available';
@@ -752,6 +756,25 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
         style: TextStyle(fontSize: 11, color: color),
       ),
     );
+  }
+
+  // Mirrors OTP_3_RC1.lua's compose_counter_text() format, same as
+  // ChatScreen's _otpComposeCounterText — see the note there. No chunking
+  // ever applies to a channel send (OTP chunking is DM-only), so [max] here
+  // is already the single-packet cap and there's no "(N chunks)" suffix.
+  String _otpComposeCounterText(MeshCoreConnector connector, int used, int max) {
+    final pad = connector.getChannelOtpPad(widget.channel.index);
+    final avail = pad?.myBytesRemaining ?? 0;
+    final headroom = (max - used).clamp(0, max);
+    return '$headroom | $used/$avail';
+  }
+
+  Color _otpComposeCounterColor(MeshCoreConnector connector, int used) {
+    final pad = connector.getChannelOtpPad(widget.channel.index);
+    final avail = pad?.myBytesRemaining ?? 0;
+    return used > avail
+        ? Theme.of(context).colorScheme.error
+        : Theme.of(context).colorScheme.onSurfaceVariant;
   }
 
   void _markAsUnread(ChannelMessage message) {
@@ -2187,12 +2210,23 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
                             ),
                           );
                         }
+                        final otpEnabled = connector.isChannelOtpEnabled(
+                          widget.channel.index,
+                        );
                         return ByteCountedTextField(
                           maxBytes: maxBytes,
                           controller: _textController,
                           focusNode: _textFieldFocusNode,
                           hintText: context.l10n.chat_typeMessage,
                           onSubmitted: (_) => _sendMessage(),
+                          counterTextBuilder: otpEnabled
+                              ? (used, max) =>
+                                    _otpComposeCounterText(connector, used, max)
+                              : null,
+                          counterColorBuilder: otpEnabled
+                              ? (used, max, defaultColor) =>
+                                    _otpComposeCounterColor(connector, used)
+                              : null,
                           encoder:
                               (connector.isChannelSmazEnabled(
                                     widget.channel.index,

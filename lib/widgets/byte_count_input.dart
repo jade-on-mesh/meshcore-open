@@ -54,6 +54,20 @@ class ByteCountedTextField extends StatelessWidget {
   /// If provided, byte limits and counters will use the encoded text length.
   final String Function(String)? encoder;
 
+  /// Optional override for the counter line's text, given the current used
+  /// byte count and [maxBytes]. Lets a call site show something other than
+  /// the default "used / max" — e.g. OTP chat screens use this to mirror
+  /// OTP_3_RC1.lua's compose_counter_text() ("remaining | typed/avail (N
+  /// chunks)") instead of this widget's generic byte-limit counter, so a
+  /// screenshot from either app reads the same way. Other call sites
+  /// (non-OTP byte-limited fields) are unaffected — they don't pass this.
+  final String Function(int usedBytes, int maxBytes)? counterTextBuilder;
+
+  /// Optional override for the counter line's color, given the same
+  /// arguments plus the color this widget would have used by default.
+  final Color Function(int usedBytes, int maxBytes, Color defaultColor)?
+  counterColorBuilder;
+
   const ByteCountedTextField({
     super.key,
     required this.maxBytes,
@@ -69,6 +83,8 @@ class ByteCountedTextField extends StatelessWidget {
     this.errorThreshold = 0.9,
     this.hideCounterWhenEmpty = true,
     this.encoder,
+    this.counterTextBuilder,
+    this.counterColorBuilder,
   });
 
   @override
@@ -83,11 +99,17 @@ class ByteCountedTextField extends StatelessWidget {
         final ratio = maxBytes > 0 ? usedBytes / maxBytes : 0.0;
         final showCounter = !(hideCounterWhenEmpty && value.text.isEmpty);
 
-        final counterColor = ratio > errorThreshold
+        final defaultCounterColor = ratio > errorThreshold
             ? Theme.of(context).colorScheme.error
             : ratio > warningThreshold
             ? Theme.of(context).colorScheme.tertiary
             : Theme.of(context).colorScheme.onSurfaceVariant;
+        final counterColor =
+            counterColorBuilder?.call(usedBytes, maxBytes, defaultCounterColor) ??
+            defaultCounterColor;
+        final counterText =
+            counterTextBuilder?.call(usedBytes, maxBytes) ??
+            '$usedBytes / $maxBytes';
 
         return Column(
           mainAxisSize: MainAxisSize.min,
@@ -125,7 +147,7 @@ class ByteCountedTextField extends StatelessWidget {
                 child: Align(
                   alignment: Alignment.centerRight,
                   child: Text(
-                    '$usedBytes / $maxBytes',
+                    counterText,
                     style: TextStyle(fontSize: 11, color: counterColor),
                   ),
                 ),

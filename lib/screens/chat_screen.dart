@@ -445,13 +445,19 @@ class _ChatScreenState extends State<ChatScreen> {
     if (pad == null) return const SizedBox.shrink();
     final remaining = pad.myBytesRemaining;
     final scheme = Theme.of(context).colorScheme;
+    // Text matches Lua's refresh_chat_bytes() byte-for-byte ("%d bytes
+    // available" + " - pad exhausted"/" - running low") so a screenshot from
+    // either app reads identically — this is what Jade compares side by
+    // side when diagnosing pad issues across platforms. Color escalation
+    // (tertiary/error) is a Flutter-only enhancement Lua's label doesn't
+    // have; keeping it doesn't break the text parity.
     final String label;
     final Color color;
     if (remaining <= 0) {
-      label = 'Pad exhausted — import a new one to keep sending';
+      label = '$remaining bytes available - pad exhausted';
       color = scheme.error;
     } else if (remaining < _padLowBytesThreshold) {
-      label = '$remaining bytes available — running low';
+      label = '$remaining bytes available - running low';
       color = scheme.tertiary;
     } else {
       label = '$remaining bytes available';
@@ -466,6 +472,48 @@ class _ChatScreenState extends State<ChatScreen> {
         style: TextStyle(fontSize: 11, color: color),
       ),
     );
+  }
+
+  // Mirrors OTP_3_RC1.lua's compose_counter_text()/update_compose_preview_and_counter()
+  // format exactly: "<headroom before single-shot cap> | <typed>/<pad avail>"
+  // plus " (N chunks)" once typed exceeds the single-shot threshold, colored
+  // red once typed exceeds the CURRENT pad balance (not just the chunking
+  // cap). Lua's own "remaining" figure is headroom-before-cap clamped at 0,
+  // not the pad balance — the pad balance is the counter's third number.
+  // This is deliberately a different shape than the generic
+  // ByteCountedTextField default ("used / max against the hard chunking
+  // cap") so the two apps' live compose counters read identically.
+  String _otpComposeCounterText(
+    MeshCoreConnector connector,
+    String contactKeyHex,
+    int used,
+  ) {
+    final singleShotCap = OtpService.maxPlaintextBytesForContact();
+    final pad = connector.getContactOtpPad(contactKeyHex);
+    final avail = pad?.myBytesRemaining ?? 0;
+    final headroom = (singleShotCap - used).clamp(0, singleShotCap);
+    var text = '$headroom | $used/$avail';
+    if (used > singleShotCap) {
+      final perChunk = singleShotCap - OtpChunkService.chunkOverheadBytes;
+      if (perChunk > 0) {
+        final chunks = (used / perChunk).ceil().clamp(1, 255);
+        text += ' ($chunks chunks)';
+      }
+    }
+    return text;
+  }
+
+  Color _otpComposeCounterColor(
+    MeshCoreConnector connector,
+    String contactKeyHex,
+    int used,
+    Color defaultColor,
+  ) {
+    final pad = connector.getContactOtpPad(contactKeyHex);
+    final avail = pad?.myBytesRemaining ?? 0;
+    return used > avail
+        ? Theme.of(context).colorScheme.error
+        : Theme.of(context).colorScheme.onSurfaceVariant;
   }
 
   Widget _buildEmptyState() {
@@ -721,6 +769,22 @@ class _ChatScreenState extends State<ChatScreen> {
                       focusNode: _textFieldFocusNode,
                       hintText: context.l10n.chat_typeMessage,
                       onSubmitted: (_) => _sendMessage(connector),
+                      counterTextBuilder: otpEnabled
+                          ? (used, max) => _otpComposeCounterText(
+                              connector,
+                              contactKeyHex,
+                              used,
+                            )
+                          : null,
+                      counterColorBuilder: otpEnabled
+                          ? (used, max, defaultColor) =>
+                                _otpComposeCounterColor(
+                                  connector,
+                                  contactKeyHex,
+                                  used,
+                                  defaultColor,
+                                )
+                          : null,
                       encoder:
                           (connector.isContactSmazEnabled(
                                 widget.contact.publicKeyHex,

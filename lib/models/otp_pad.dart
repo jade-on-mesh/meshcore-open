@@ -2,17 +2,19 @@ import 'dart:typed_data';
 
 import '../connector/meshcore_protocol.dart' show hex2Uint8List;
 
-/// Which half of a shared pad this device sends from.
+/// Which end of a shared pad this device sends from.
 ///
-/// Only meaningful when [OtpPad.mode] is [OtpPadMode.twoPartyHalfSplit]. A
-/// shared pad is split in half at import time: Party A always sends from
-/// the first half and Party B always sends from the second half. Each side
-/// tracks its own two offsets — how far it has advanced into ITS OWN
-/// sending half, and how far it has advanced into the OTHER party's half
-/// (as messages from them are decrypted). A pad byte is used exactly once,
-/// ever, by construction — there's no way for both sides to draw from the
-/// same range, because each only ever writes into (encrypts with) its own
-/// half and only ever reads from (decrypts with) the other's.
+/// Only meaningful when [OtpPad.mode] is [OtpPadMode.twoPartyHalfSplit].
+/// This is NOT a fixed 50/50 split of the buffer — it mirrors Lua's actual
+/// `pdib()`/`pks()` behavior: Party A's own sends consume bytes growing
+/// FORWARD from byte 0; Party B's own sends consume bytes growing BACKWARD
+/// from the very end of the buffer. The two growing regions are only
+/// guaranteed never to overlap because every send is gated on the combined
+/// remaining budget (see [OtpPad.myBytesRemaining]) — there's no separate
+/// per-party cap at the midpoint the way an earlier version of this class
+/// modeled it (that fixed-half version produced different byte ranges than
+/// Lua for Party B and silently failed to decrypt against a real Lua peer
+/// — see platform-learnings.md, 2026-10-05).
 ///
 /// The two people sharing a pad must agree out of band on who is A and who
 /// is B — get this wrong on either end and messages won't decrypt, but
@@ -54,10 +56,12 @@ OtpPadRole? resolveDmRole({
 /// This mirrors WADAMESH OTP_2_RC15.lua's `pmi_v` party-mode setting and
 /// its `pdib()` ("pad direction is back?") function:
 ///
-///  - Two-party pads (`pmi_v` 2 or 3 in Lua) split the pad into a front
-///    half and a back half: each side always sends from its own half and
-///    decrypts incoming messages with the other's half. `pdib()` returns
-///    true only for the party reading from the back.
+///  - Two-party pads (`pmi_v` 2 or 3 in Lua): Party A always sends growing
+///    forward from the front of the buffer; Party B always sends growing
+///    backward from the very end. `pdib()` returns true only for the
+///    direction reading from the back (Party A decrypting Party B's
+///    messages, or Party B's own sends). This is NOT a fixed-size half for
+///    each party — see [OtpPadRole]'s doc comment.
 ///
 ///  - Multi/channel pads (`pmi_v` 1 in Lua — and Lua *forces* this mode
 ///    whenever the destination is a channel, via
@@ -152,40 +156,38 @@ class OtpPad {
   bool get isSharedSequential => mode == OtpPadMode.sharedSequential;
 
   int get totalBytes => padHex.length ~/ 2;
-  int get halfBytes => totalBytes ~/ 2;
-
-  int get myHalfStart =>
-      isSharedSequential ? 0 : (role == OtpPadRole.a ? 0 : halfBytes);
-  int get myHalfLength => isSharedSequential
-      ? totalBytes
-      : (role == OtpPadRole.a ? halfBytes : (totalBytes - halfBytes));
-
-  int get theirHalfStart =>
-      isSharedSequential ? 0 : (role == OtpPadRole.a ? halfBytes : 0);
-  int get theirHalfLength => isSharedSequential
-      ? totalBytes
-      : (role == OtpPadRole.a ? (totalBytes - halfBytes) : halfBytes);
 
   /// The offset actually driving "my" consumption — [offset] in shared
   /// mode, [myOffset] in two-party mode.
   int get _myOffsetEffective => isSharedSequential ? offset : myOffset;
   int get _theirOffsetEffective => isSharedSequential ? offset : theirOffset;
 
-  int get myBytesRemaining =>
-      (myHalfLength - _myOffsetEffective).clamp(0, myHalfLength);
-  int get theirBytesRemaining =>
-      (theirHalfLength - _theirOffsetEffective).clamp(0, theirHalfLength);
+  /// Combined remaining budget. Mirrors Lua's emmb():
+  /// `#rec.bytes - ctr_mine - ctr_theirs`. In [OtpPadMode.twoPartyHalfSplit]
+  /// there is deliberately no FIXED half-sized cap per direction — my sends
+  /// and their sends draw down the SAME pool from opposite ends of one
+  /// buffer (see [takeMyKeyBytes]/[takeTheirKeyBytes]), exactly like Lua's
+  /// pks()/pdib(), so [myBytesRemaining] and [theirBytesRemaining] below
+  /// are the same number by construction — there's no Lua-side concept of
+  /// "my half" vs "their half" remaining as two independent figures, only
+  /// one shared budget both directions draw from.
+  int get _combinedRemaining => isSharedSequential
+      ? (totalBytes - offset).clamp(0, totalBytes)
+      : (totalBytes - myOffset - theirOffset).clamp(0, totalBytes);
 
-  double get myUsageFraction => myHalfLength == 0
-      ? 1.0
-      : (_myOffsetEffective / myHalfLength).clamp(0.0, 1.0);
-  double get theirUsageFraction => theirHalfLength == 0
-      ? 1.0
-      : (_theirOffsetEffective / theirHalfLength).clamp(0.0, 1.0);
+  int get myBytesRemaining => _combinedRemaining;
+  int get theirBytesRemaining => _combinedRemaining;
 
-  /// True once the pad (or, for two-party mode, either half) is fully
-  /// consumed — the pad needs replacing.
-  bool get isExhausted => myBytesRemaining == 0 || theirBytesRemaining == 0;
+  double get myUsageFraction => totalBytes == 0
+      ? 1.0
+      : (_myOffsetEffective / totalBytes).clamp(0.0, 1.0);
+  double get theirUsageFraction => totalBytes == 0
+      ? 1.0
+      : (_theirOffsetEffective / totalBytes).clamp(0.0, 1.0);
+
+  /// True once the shared budget is fully consumed — the pad needs
+  /// replacing.
+  bool get isExhausted => _combinedRemaining <= 0;
 
   Uint8List _takeBytes(int start, int length) {
     final all = hex2Uint8List(padHex);
@@ -194,18 +196,45 @@ class OtpPad {
     return all.sublist(start, end);
   }
 
-  /// The next unused slice of THIS device's own sending half, [length]
+  /// Takes [length] bytes starting [offset] bytes from the END of the
+  /// buffer and growing toward the middle as [offset] increases — the
+  /// mirror image of [_takeBytes], which grows from the front.
+  Uint8List _takeBytesFromEnd(int offset, int length) {
+    final all = hex2Uint8List(padHex);
+    final end = (all.length - offset).clamp(0, all.length);
+    final start = (end - length).clamp(0, end);
+    if (end <= start) return Uint8List(0);
+    return all.sublist(start, end);
+  }
+
+  /// Role A's own sends grow forward from byte 0 (true only for B).
+  bool get _myGrowsBackFromEnd =>
+      !isSharedSequential && role == OtpPadRole.b;
+
+  /// The next unused slice of THIS device's own sending stream, [length]
   /// bytes long ([OtpPadMode.twoPartyHalfSplit] only). Does not mutate
   /// state — call [copyWith] (via the store) once the bytes are actually
   /// spent on a sent message.
-  Uint8List takeMyKeyBytes(int length) =>
-      _takeBytes(myHalfStart + myOffset, length);
+  ///
+  /// Mirrors Lua's pks(rec, n, "mine")/pdib(): Party A consumes forward
+  /// from the front of the shared buffer; Party B consumes backward from
+  /// the very end. There is no fixed halfway boundary — the two directions
+  /// just can never combine past the buffer's full length (enforced by
+  /// [myBytesRemaining] before a send is allowed). A FIXED half-split (A
+  /// always [0, len/2), B always [len/2, len), both growing forward) is a
+  /// different, incompatible byte range from Lua's and will fail to
+  /// decrypt against a real Lua peer — see platform-learnings.md.
+  Uint8List takeMyKeyBytes(int length) => _myGrowsBackFromEnd
+      ? _takeBytesFromEnd(myOffset, length)
+      : _takeBytes(myOffset, length);
 
-  /// The next unused slice of the OTHER party's half, [length] bytes long,
-  /// used to decrypt one of their incoming messages
-  /// ([OtpPadMode.twoPartyHalfSplit] only).
-  Uint8List takeTheirKeyBytes(int length) =>
-      _takeBytes(theirHalfStart + theirOffset, length);
+  /// The next unused slice used to decrypt the OTHER party's incoming
+  /// messages, [length] bytes long ([OtpPadMode.twoPartyHalfSplit] only).
+  /// The mirror image of [takeMyKeyBytes] — Party A reads the other
+  /// party's bytes from the back, Party B reads them from the front.
+  Uint8List takeTheirKeyBytes(int length) => _myGrowsBackFromEnd
+      ? _takeBytes(theirOffset, length)
+      : _takeBytesFromEnd(theirOffset, length);
 
   /// The next unused slice of the ONE shared pad, [length] bytes long
   /// ([OtpPadMode.sharedSequential] only). Used identically for both

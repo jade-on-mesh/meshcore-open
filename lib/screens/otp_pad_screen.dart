@@ -425,6 +425,21 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               approxMessages: (pad.myBytesRemaining / maxPerMsg).floor(),
             )
           else ...[
+            // Both rows below share ONE combined budget (mirrors Lua's
+            // pks()/pdib() — Party A grows forward from byte 0, Party B
+            // grows backward from the end of the same buffer, see
+            // OtpPad.takeMyKeyBytes) — there's no independently-sized "my
+            // half" vs "their half", so the "B left" figure is
+            // deliberately identical on both rows; only the fill fraction
+            // (how much of the shared pad each side has personally used)
+            // differs between them.
+            Text(
+              'Shared budget — sending and receiving draw from the same pool',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 8),
             _usageRow(
               context,
               label: 'Your messages',
