@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../build_info.dart';
 import '../connector/meshcore_connector.dart';
 import '../models/channel.dart';
 import '../models/contact.dart';
@@ -490,6 +491,18 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               ),
             ),
           ],
+          const SizedBox(height: 16),
+          // Mirrors Lua's "Build: <BUILD_ID>" line on its own pad/settings
+          // screens (see build_info.dart) — lets you confirm, at a glance,
+          // which numbered OTP patch this install is actually running when
+          // comparing behavior against the T-Deck/ThinkNode side.
+          Text(
+            'OTP build: $otpBuildId',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              fontSize: 10.5,
+            ),
+          ),
         ],
       ),
     );
