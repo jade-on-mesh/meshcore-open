@@ -1610,6 +1610,7 @@ class MeshCoreConnector extends ChangeNotifier {
       // reply below reaches them.
       if (!roleCollision) {
         _trackContactResyncGap(contact.publicKeyHex, peerMyOffset);
+        _maybeSkipSendSideContact(contact.publicKeyHex, peerTheirOffset);
       } else {
         _pendingContactResync.remove(contact.publicKeyHex);
       }
@@ -1626,13 +1627,14 @@ class MeshCoreConnector extends ChangeNotifier {
     if (!payload.isReply &&
         pad != null &&
         _shouldSendPromptSyncCheck('c:${contact.publicKeyHex}')) {
-      final reply = pad.isSharedSequential
-          ? OtpSyncService.buildShared(isReply: true, offset: pad.offset)
+      final livePad = getContactOtpPad(contact.publicKeyHex) ?? pad;
+      final reply = livePad.isSharedSequential
+          ? OtpSyncService.buildShared(isReply: true, offset: livePad.offset)
           : OtpSyncService.buildTwoParty(
               isReply: true,
-              myOffset: pad.myOffset,
-              theirOffset: pad.theirOffset,
-              role: pad.role,
+              myOffset: livePad.myOffset,
+              theirOffset: livePad.theirOffset,
+              role: livePad.role,
             );
       unawaited(
         sendFrame(
@@ -1779,6 +1781,28 @@ class MeshCoreConnector extends ChangeNotifier {
     _otpResyncTimers[timerKey] = Timer(
       _resyncGracePeriod,
       () => _maybeAutoResyncContact(contactKeyHex),
+    );
+  }
+
+  /// DM-only send-side repair. A peer can only have decrypted bytes this
+  /// device actually sent, so peerTheirOffset > myOffset is never in-flight
+  /// lag, only a desync (peer consumed bytes we never used). Burn our own
+  /// unused send bytes up to the peer's count so the next message lines up.
+  /// Never used for channels: shared counter, many writers.
+  void _maybeSkipSendSideContact(String contactKeyHex, int peerTheirOffset) {
+    final pad = getContactOtpPad(contactKeyHex);
+    if (pad == null || pad.isSharedSequential) return;
+    final gap = peerTheirOffset - pad.myOffset;
+    if (gap <= 0) return;
+    if (gap > pad.myBytesRemaining || gap > _maxAutoResyncAbsBytes) return;
+    final updated = pad.copyWith(myOffset: pad.myOffset + gap);
+    _contactOtpPads[contactKeyHex] = updated;
+    unawaited(_otpPadStore.saveContactPad(contactKeyHex, updated));
+    _contactOtpSyncStatus[contactKeyHex] = OtpSyncStatus(
+      checkedAt: DateTime.now(),
+      repliedAt: DateTime.now(),
+      inSync: true,
+      autoResyncedBytes: gap,
     );
   }
 
