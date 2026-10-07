@@ -16,16 +16,23 @@ Color otpDarken(Color color, double factor) {
   return Color(0xFF000000 | (scale(16) << 16) | (scale(8) << 8) | scale(0));
 }
 
-/// Ports OTP_3_RC1.lua's `contrast_of`: perceived-luminance threshold
-/// deciding bubble text color against a fill - same formula, same 140
-/// cutoff, same two fallback colors.
+double _contrastRatio(Color a, Color b) {
+  final la = a.computeLuminance();
+  final lb = b.computeLuminance();
+  final hi = la > lb ? la : lb;
+  final lo = la > lb ? lb : la;
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/// Bubble text color: near-white if it reads clearly (WCAG ratio >= 4.5)
+/// against [color]; otherwise a deep shade of the bubble's own hue, and
+/// plain near-black only if even that is too close.
 Color otpContrastOf(Color color) {
-  final argb = color.toARGB32();
-  final r = (argb >> 16) & 0xFF;
-  final g = (argb >> 8) & 0xFF;
-  final b = argb & 0xFF;
-  final lum = 0.299 * r + 0.587 * g + 0.114 * b;
-  return lum > 140 ? const Color(0xFF14171C) : const Color(0xFFF5F5F5);
+  const light = Color(0xFFF5F5F5);
+  if (_contrastRatio(color, light) >= 4.5) return light;
+  final shade = otpDarken(color, 0.2);
+  if (_contrastRatio(color, shade) >= 4.5) return shade;
+  return const Color(0xFF14171C);
 }
 
 /// Ports OTP_3_RC1.lua's `color_for_sender`: assigns each distinct sender
