@@ -283,6 +283,7 @@ class AppSettings {
       'map_show_guessed_locations': mapShowGuessedLocations,
       'enable_message_tracing': enableMessageTracing,
       'otp_theme_index': otpThemeIndex,
+      'otp_theme_schema': 2,
       'map_cache_bounds': mapCacheBounds,
       'map_cache_min_zoom': mapCacheMinZoom,
       'map_cache_max_zoom': mapCacheMaxZoom,
@@ -361,7 +362,10 @@ class AppSettings {
       mapShowGuessedLocations:
           json['map_show_guessed_locations'] as bool? ?? true,
       enableMessageTracing: json['enable_message_tracing'] as bool? ?? true,
-      otpThemeIndex: json['otp_theme_index'] as int? ?? 0,
+      otpThemeIndex: (json['otp_theme_schema'] as int? ?? 1) >= 2
+          ? (json['otp_theme_index'] as int? ?? 0)
+          : const [0, 1, 2, 3, 0, 4, 0, 5, 0][
+              ((json['otp_theme_index'] as int? ?? 0)).clamp(0, 8)],
       mapCacheBounds: (json['map_cache_bounds'] as Map?)?.map(
         (key, value) => MapEntry(key.toString(), (value as num).toDouble()),
       ),

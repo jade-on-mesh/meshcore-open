@@ -140,20 +140,6 @@ class OtpTheme {
       bg: Color(0xFF000000),
     ),
     OtpTheme(
-      name: 'Mono',
-      encrypt: Color(0xFF00FF00),
-      decrypt: Color(0xFF00DD00),
-      ciphertext: Color(0xFF00BB00),
-      plaintext: Color(0xFFDDFFDD),
-      newpad: Color(0xFF22CC22),
-      channel: Color(0xFF33FF33),
-      resultOk: Color(0xFF11FF11),
-      keyphrase: Color(0xFF88EE88),
-      padinfo: Color(0xFF449944),
-      ready: Color(0xFF336633),
-      bg: Color(0xFF000000),
-    ),
-    OtpTheme(
       name: 'B&W',
       encrypt: Color(0xFFFFFFFF),
       decrypt: Color(0xFFE6E6E6),
@@ -169,21 +155,7 @@ class OtpTheme {
     ),
     OtpTheme(
       name: 'Acid',
-      encrypt: Color(0xFFCCFF00),
-      decrypt: Color(0xFFFF00FF),
-      ciphertext: Color(0xFF00FFCC),
-      plaintext: Color(0xFFFFFFFF),
-      newpad: Color(0xFFFFFF00),
-      channel: Color(0xFFFF0099),
-      resultOk: Color(0xFF66FF00),
-      keyphrase: Color(0xFFCCFF99),
-      padinfo: Color(0xFF9933FF),
-      ready: Color(0xFF666699),
-      bg: Color(0xFF000000),
-    ),
-    OtpTheme(
-      name: 'Dark',
-      // Repalette (2026-10-04, full 9-theme audit): `ciphertext` (crimson)
+      // Repalette (2026-10-04, full theme audit): `ciphertext` (crimson)
       // and `newpad` (tomato) both sat within 12 degrees of `channel`'s
       // pure red - a received sender could land on a near-identical red
       // to your own sent bubble. Moved them to a smoke/ash slate and a
@@ -204,28 +176,6 @@ class OtpTheme {
       keyphrase: Color(0xFFFFDAB9),
       padinfo: Color(0xFF8B0000),
       ready: Color(0xFF696969),
-      bg: Color(0xFF000000),
-    ),
-    OtpTheme(
-      name: 'Ice Cream',
-      // Repalette (2026-10-04, full 9-theme audit): `decrypt` and
-      // `resultOk` were nearly identical pastel mint greens (5 degrees
-      // apart), and the whole set's low saturation meant several bubbles
-      // darkened close to unreadable gray, `channel` (the sent-bubble
-      // color) included. Reassigned the sender-pool colors to 5 distinct,
-      // slightly richer "flavors" - pistachio, grape, peach, blueberry,
-      // mint - and gave `channel` a bolder cotton-candy blue so it still
-      // reads as pastel without washing out after darkening.
-      encrypt: Color(0xFFFFB6C1), // strawberry (unchanged)
-      decrypt: Color(0xFFD4E8A8), // pistachio
-      ciphertext: Color(0xFFD8A8E8), // grape
-      plaintext: Color(0xFFFFF8E7),
-      newpad: Color(0xFFFFDAB9), // peach (unchanged)
-      channel: Color(0xFF7FCDE0), // cotton-candy blue - richer than before
-      resultOk: Color(0xFFA8E6CF), // mint (unchanged)
-      keyphrase: Color(0xFFA8C4EA), // blueberry
-      padinfo: Color(0xFFFFF9C4),
-      ready: Color(0xFFFFB7B2),
       bg: Color(0xFF000000),
     ),
   ];
