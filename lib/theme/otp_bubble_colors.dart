@@ -63,6 +63,16 @@ class OtpSenderColors {
   int get trackedCount => _order.length;
 }
 
+/// Bubble fill is the theme's own palette color, unmodified (an in-flight
+/// send is blended 40% toward the theme background so it reads as pending).
+/// The outline is the same color lightened toward white so the edge shows.
+/// Lua darkens every fill to ~35% for its small LCD; on a phone that turned
+/// every theme into muddy near-black versions of its palette.
+Color _otpFill(OtpTheme theme, Color base, {bool dim = false}) =>
+    dim ? Color.lerp(theme.bg, base, 0.6)! : base;
+
+Color _otpEdge(Color base) => Color.lerp(base, const Color(0xFFFFFFFF), 0.35)!;
+
 /// The three colors one bubble needs, resolved for a single message's
 /// state - mirrors `refresh_chat_view`'s per-bubble `outline_color`/
 /// `fill_color`/`text_color` math in OTP_3_RC1.lua exactly, including the
@@ -103,9 +113,9 @@ OtpBubbleColors otpOutgoingBubbleColors({
   } else {
     outline = theme.channel; // sent or plain pending
   }
-  final fill = otpDarken(outline, (pending || retrying) ? 0.32 : 0.35);
+  final fill = _otpFill(theme, outline, dim: pending || retrying);
   return OtpBubbleColors(
-    outline: outline,
+    outline: _otpEdge(outline),
     fill: fill,
     text: otpContrastOf(fill),
   );
@@ -124,9 +134,9 @@ OtpBubbleColors otpReceivedBubbleColors({
   final outline = failed
       ? theme.encrypt
       : OtpSenderColors.instance.colorFor(senderName, theme);
-  final fill = otpDarken(outline, 0.35);
+  final fill = _otpFill(theme, outline);
   return OtpBubbleColors(
-    outline: outline,
+    outline: _otpEdge(outline),
     fill: fill,
     text: otpContrastOf(fill),
   );
