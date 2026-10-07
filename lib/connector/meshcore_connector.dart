@@ -1544,6 +1544,92 @@ class MeshCoreConnector extends ChangeNotifier {
   /// here, including sending the automatic reply) and must NOT be shown as
   /// a chat message — mirrors how a chunk piece/ack "handled" result
   /// suppresses display in [_dispatchOtpContact].
+  static final RegExp _nackPattern = RegExp(r'^z4([CDG])z$');
+  DateTime? _lastNackAt;
+
+  bool _nackAllowed() {
+    final now = DateTime.now();
+    final last = _lastNackAt;
+    if (last != null && now.difference(last).inSeconds < 3) return false;
+    _lastNackAt = now;
+    return true;
+  }
+
+  void _sendContactNack(Contact contact, String reason) {
+    if (!_nackAllowed()) return;
+    unawaited(
+      sendFrame(
+        buildSendTextMsgFrame(
+          contact.publicKey,
+          prepareContactOutboundText(contact, 'z4${reason}z'),
+        ),
+      ),
+    );
+  }
+
+  void _sendChannelNack(int channelIndex, String reason) {
+    if (!_nackAllowed()) return;
+    unawaited(
+      sendFrame(
+        buildSendChannelTextMsgFrame(
+          channelIndex,
+          prepareChannelOutboundText(channelIndex, 'z4${reason}z'),
+        ),
+      ),
+    );
+  }
+
+  bool _maybeHandleContactNack(Contact contact, String text) {
+    if (!_nackPattern.hasMatch(text.trim())) return false;
+    final key = contact.publicKeyHex;
+    final pending = _pendingContactChunkSends[key];
+    if (pending != null) {
+      _finishContactChunkSend(pending, success: false);
+      notifyListeners();
+      return true;
+    }
+    final messages = _conversations[key];
+    if (messages != null) {
+      for (var i = messages.length - 1; i >= 0; i--) {
+        final m = messages[i];
+        if (m.isOutgoing &&
+            (m.status == MessageStatus.sent ||
+                m.status == MessageStatus.pending)) {
+          _updateStoredContactMessage(
+            key,
+            m.messageId,
+            (cur) => cur.copyWith(status: MessageStatus.failed),
+          );
+          break;
+        }
+      }
+    }
+    notifyListeners();
+    return true;
+  }
+
+  bool _maybeHandleChannelNack(int channelIndex, String text) {
+    if (!_nackPattern.hasMatch(text.trim())) return false;
+    final messages = _channelMessages[channelIndex];
+    if (messages != null) {
+      for (var i = messages.length - 1; i >= 0; i--) {
+        final m = messages[i];
+        if (m.isOutgoing &&
+            (m.status == ChannelMessageStatus.sent ||
+                m.status == ChannelMessageStatus.pending)) {
+          _updateStoredChannelMessage(
+            channelIndex,
+            m.messageId,
+            (cur) => cur.copyWith(status: ChannelMessageStatus.failed),
+          );
+          break;
+        }
+      }
+    }
+    notifyListeners();
+    return true;
+  }
+
   bool _maybeHandleContactSyncMessage(Contact contact, String text) {
     if (!OtpSyncService.looksLikeSyncMessage(text)) return false;
     final payload = OtpSyncService.parse(text);
@@ -2303,6 +2389,7 @@ class MeshCoreConnector extends ChangeNotifier {
       _requestPromptContactSyncCheck(contactKeyHex);
     } catch (e) {
       appLogger.warn('OTP decrypt failed for contact $contactKeyHex: $e');
+      _sendContactNack(contact, 'D');
       _requestPromptContactSyncCheck(contactKeyHex);
       return (
         handled: true,
@@ -2419,6 +2506,7 @@ class MeshCoreConnector extends ChangeNotifier {
         // message), so all that's actionable here is getting this
         // channel's own counter caught up as fast as possible.
         checkChannelPadSync(channelIndex);
+        _sendChannelNack(channelIndex, 'C');
         return (
           handled: true,
           displayText:
@@ -2453,6 +2541,7 @@ class MeshCoreConnector extends ChangeNotifier {
       _requestPromptChannelSyncCheck(channelIndex);
     } catch (e) {
       appLogger.warn('OTP decrypt failed for channel $channelIndex: $e');
+      _sendChannelNack(channelIndex, 'D');
       _requestPromptChannelSyncCheck(channelIndex);
       return (
         handled: true,
@@ -8249,6 +8338,7 @@ class MeshCoreConnector extends ChangeNotifier {
         // ciphertext) and must never appear as a chat bubble — checked
         // before OTP dispatch so this works even when OTP isn't (or isn't
         // yet) enabled for this contact.
+        if (_maybeHandleContactNack(contact, decodedText)) return null;
         if (_maybeHandleContactSyncMessage(contact, decodedText)) return null;
         final otpResult = _dispatchOtpContact(contact, decodedText);
         if (otpResult.handled) {
@@ -8543,6 +8633,9 @@ class MeshCoreConnector extends ChangeNotifier {
       }
       // Pad sync-check control messages (see the note in
       // _parseContactMessage) — checked before OTP dispatch, same reasoning.
+      if (_maybeHandleChannelNack(parsed.channelIndex!, parsed.text)) {
+        return;
+      }
       if (_maybeHandleChannelSyncMessage(
         parsed.channelIndex!,
         parsed.senderName,
@@ -8657,6 +8750,9 @@ class MeshCoreConnector extends ChangeNotifier {
           // Pad sync-check control messages — same reasoning as the
           // _handleIncomingChannelMessage hook; this is the second,
           // independent channel-receive path, so it needs the same check.
+          if (_maybeHandleChannelNack(channel.index, decodedText)) {
+            return;
+          }
           if (_maybeHandleChannelSyncMessage(
             channel.index,
             parsed.senderName,
