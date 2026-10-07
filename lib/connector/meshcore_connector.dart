@@ -1545,6 +1545,7 @@ class MeshCoreConnector extends ChangeNotifier {
   /// a chat message — mirrors how a chunk piece/ack "handled" result
   /// suppresses display in [_dispatchOtpContact].
   static final RegExp _nackPattern = RegExp(r'^z4([CDG])z$');
+  final Set<String> _nackRetryKeys = {};
   DateTime? _lastNackAt;
 
   bool _nackAllowed() {
@@ -1609,7 +1610,8 @@ class MeshCoreConnector extends ChangeNotifier {
   }
 
   bool _maybeHandleChannelNack(int channelIndex, String text) {
-    if (!_nackPattern.hasMatch(text.trim())) return false;
+    final nack = _nackPattern.firstMatch(text.trim());
+    if (nack == null) return false;
     final messages = _channelMessages[channelIndex];
     if (messages != null) {
       for (var i = messages.length - 1; i >= 0; i--) {
@@ -1622,6 +1624,26 @@ class MeshCoreConnector extends ChangeNotifier {
             m.messageId,
             (cur) => cur.copyWith(status: ChannelMessageStatus.failed),
           );
+          final plain = m.otpPlaintext;
+          final key = '$channelIndex:$plain';
+          if (nack.group(1) == 'C' && plain != null) {
+            if (_nackRetryKeys.remove(key)) break;
+            _nackRetryKeys.add(key);
+            Timer(const Duration(seconds: 60), () => _nackRetryKeys.remove(key));
+            Timer(
+              Duration(
+                milliseconds: 2000 + _channelJitterRandom.nextInt(4000),
+              ),
+              () {
+                for (final c in _channels) {
+                  if (c.index == channelIndex) {
+                    unawaited(sendChannelMessage(c, plain));
+                    break;
+                  }
+                }
+              },
+            );
+          }
           break;
         }
       }
