@@ -165,6 +165,7 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
               _buildHeroCard(context, connector, pad),
               const SectionHeader('Chat theme'),
               _buildThemeCard(context),
+              _buildTextColorCard(context),
               if (pad != null) ...[
                 const SectionHeader('Pad usage'),
                 _buildUsageCard(context, connector, pad),
@@ -775,6 +776,28 @@ class _OtpPadScreenState extends State<OtpPadScreen> {
         ),
         trailing: const Icon(Icons.chevron_right),
         onTap: () => _showThemePicker(context, settingsService),
+      ),
+    );
+  }
+
+  Widget _buildTextColorCard(BuildContext context) {
+    final settingsService = context.watch<AppSettingsService>();
+    return MeshCard(
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Bubble text color'),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: SegmentedButton<int>(
+            segments: const [
+              ButtonSegment(value: 0, label: Text('Auto')),
+              ButtonSegment(value: 1, label: Text('White')),
+              ButtonSegment(value: 2, label: Text('Black')),
+            ],
+            selected: {settingsService.settings.otpTextMode},
+            onSelectionChanged: (s) => settingsService.setOtpTextMode(s.first),
+          ),
+        ),
       ),
     );
   }

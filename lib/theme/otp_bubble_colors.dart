@@ -80,6 +80,12 @@ Color _otpFill(OtpTheme theme, Color base, {bool dim = false}) =>
 
 Color _otpEdge(Color base) => Color.lerp(base, const Color(0xFFFFFFFF), 0.35)!;
 
+Color _otpText(Color fill, int textMode) => textMode == 1
+    ? const Color(0xFFFFFFFF)
+    : textMode == 2
+    ? const Color(0xFF000000)
+    : otpContrastOf(fill);
+
 /// The three colors one bubble needs, resolved for a single message's
 /// state - mirrors `refresh_chat_view`'s per-bubble `outline_color`/
 /// `fill_color`/`text_color` math in OTP_3_RC1.lua exactly, including the
@@ -107,6 +113,7 @@ OtpBubbleColors otpOutgoingBubbleColors({
   bool waiting = false,
   bool retrying = false,
   bool pending = false,
+  int textMode = 0,
 }) {
   final Color outline;
   if (failed) {
@@ -124,7 +131,7 @@ OtpBubbleColors otpOutgoingBubbleColors({
   return OtpBubbleColors(
     outline: _otpEdge(outline),
     fill: fill,
-    text: otpContrastOf(fill),
+    text: _otpText(fill, textMode),
   );
 }
 
@@ -137,6 +144,7 @@ OtpBubbleColors otpReceivedBubbleColors({
   required OtpTheme theme,
   required String senderName,
   bool failed = false,
+  int textMode = 0,
 }) {
   final outline = failed
       ? theme.encrypt
@@ -145,6 +153,6 @@ OtpBubbleColors otpReceivedBubbleColors({
   return OtpBubbleColors(
     outline: _otpEdge(outline),
     fill: fill,
-    text: otpContrastOf(fill),
+    text: _otpText(fill, textMode),
   );
 }

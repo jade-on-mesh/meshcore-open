@@ -1831,6 +1831,7 @@ class _MessageBubble extends StatelessWidget {
         ? (isOutgoing
               ? otpOutgoingBubbleColors(
                   theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  textMode: settingsService.settings.otpTextMode,
                   failed: isFailed,
                   delivered: message.status == MessageStatus.delivered,
                   waiting: message.status == MessageStatus.waiting,
@@ -1843,6 +1844,7 @@ class _MessageBubble extends StatelessWidget {
                 )
               : otpReceivedBubbleColors(
                   theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  textMode: settingsService.settings.otpTextMode,
                   senderName: senderName,
                   failed: isFailed,
                 ))

@@ -846,11 +846,13 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
         ? (isOutgoing
               ? otpOutgoingBubbleColors(
                   theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  textMode: settingsService.settings.otpTextMode,
                   failed: message.status == ChannelMessageStatus.failed,
                   pending: message.status == ChannelMessageStatus.pending,
                 )
               : otpReceivedBubbleColors(
                   theme: OtpTheme.all[settingsService.settings.otpThemeIndex],
+                  textMode: settingsService.settings.otpTextMode,
                   senderName: message.senderName,
                   failed: message.status == ChannelMessageStatus.failed,
                 ))
@@ -1846,12 +1848,20 @@ class _ChannelChatScreenState extends State<ChannelChatScreen> {
               .settings
               .otpThemeIndex]
         : null;
+    final otpTextMode = context
+        .watch<AppSettingsService>()
+        .settings
+        .otpTextMode;
     final otpColors = otpTheme == null
         ? null
         : (isOutgoing
-              ? otpOutgoingBubbleColors(theme: otpTheme)
+              ? otpOutgoingBubbleColors(
+                  theme: otpTheme,
+                  textMode: otpTextMode,
+                )
               : otpReceivedBubbleColors(
                   theme: otpTheme,
+                  textMode: otpTextMode,
                   senderName: _imageSenderLabel(entry),
                   failed:
                       entry.state == ReceivedImageState.failedIncomplete ||

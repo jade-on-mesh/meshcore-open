@@ -125,7 +125,7 @@ class OtpTheme {
       // several received senders and even a received-vs-sent bubble could
       // read as the same color. Rebuilt around 5 clearly separated PNW
       // hues - glacier blue, mountain-dusk purple, sunset amber,
-      // huckleberry pink, moss green - verified by hue distance, not by
+      // white, moss green - verified by hue distance, not by
       // eye, so it's not guesswork.
       encrypt: Color(0xFF60A5FA), // sky blue (unchanged)
       decrypt: Color(0xFF38BDF8), // glacier blue
@@ -134,7 +134,7 @@ class OtpTheme {
       newpad: Color(0xFFFBBF24), // sunset amber
       channel: Color(0xFF15803D), // forest green (unchanged - "mine")
       resultOk: Color(0xFF84CC16), // moss/lime green - distinct shade from channel
-      keyphrase: Color(0xFFF472B6), // huckleberry pink
+      keyphrase: Color(0xFFFFFFFF), // white (replaces huckleberry pink)
       padinfo: Color(0xFF22C55E),
       ready: Color(0xFFCBD5E1),
       bg: Color(0xFF000000),

@@ -96,6 +96,8 @@ class AppSettings {
   // otp_theme.dart for the actual palette data (ported byte-for-byte from
   // the Lua THEME_DATA table) and otp_pad_screen.dart for the picker.
   final int otpThemeIndex;
+  // 0 = auto contrast, 1 = white, 2 = black text on OTP bubbles.
+  final int otpTextMode;
   final Map<String, double>? mapCacheBounds;
   final int mapCacheMinZoom;
   final int mapCacheMaxZoom;
@@ -207,6 +209,7 @@ class AppSettings {
     this.mapShowGuessedLocations = true,
     this.enableMessageTracing = true,
     this.otpThemeIndex = 0,
+    this.otpTextMode = 0,
     this.mapCacheBounds,
     this.mapCacheMinZoom = 10,
     this.mapCacheMaxZoom = 15,
@@ -283,6 +286,7 @@ class AppSettings {
       'map_show_guessed_locations': mapShowGuessedLocations,
       'enable_message_tracing': enableMessageTracing,
       'otp_theme_index': otpThemeIndex,
+      'otp_text_mode': otpTextMode,
       'otp_theme_schema': 2,
       'map_cache_bounds': mapCacheBounds,
       'map_cache_min_zoom': mapCacheMinZoom,
@@ -366,6 +370,7 @@ class AppSettings {
           ? (json['otp_theme_index'] as int? ?? 0)
           : const [0, 1, 2, 3, 0, 4, 0, 5, 0][
               ((json['otp_theme_index'] as int? ?? 0)).clamp(0, 8)],
+      otpTextMode: json['otp_text_mode'] as int? ?? 0,
       mapCacheBounds: (json['map_cache_bounds'] as Map?)?.map(
         (key, value) => MapEntry(key.toString(), (value as num).toDouble()),
       ),
@@ -504,6 +509,7 @@ class AppSettings {
     bool? mapShowGuessedLocations,
     bool? enableMessageTracing,
     int? otpThemeIndex,
+    int? otpTextMode,
     Object? mapCacheBounds = _unset,
     int? mapCacheMinZoom,
     int? mapCacheMaxZoom,
@@ -565,6 +571,7 @@ class AppSettings {
           mapShowGuessedLocations ?? this.mapShowGuessedLocations,
       enableMessageTracing: enableMessageTracing ?? this.enableMessageTracing,
       otpThemeIndex: otpThemeIndex ?? this.otpThemeIndex,
+      otpTextMode: otpTextMode ?? this.otpTextMode,
       mapCacheBounds: mapCacheBounds == _unset
           ? this.mapCacheBounds
           : mapCacheBounds as Map<String, double>?,

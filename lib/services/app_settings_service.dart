@@ -78,6 +78,10 @@ class AppSettingsService extends ChangeNotifier {
     await updateSettings(_settings.copyWith(otpThemeIndex: clamped));
   }
 
+  Future<void> setOtpTextMode(int value) async {
+    await updateSettings(_settings.copyWith(otpTextMode: value.clamp(0, 2)));
+  }
+
   Future<void> setMapShowRepeaters(bool value) async {
     await updateSettings(_settings.copyWith(mapShowRepeaters: value));
   }
