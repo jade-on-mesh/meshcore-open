@@ -1619,29 +1619,53 @@ class MeshCoreConnector extends ChangeNotifier {
         if (m.isOutgoing &&
             (m.status == ChannelMessageStatus.sent ||
                 m.status == ChannelMessageStatus.pending)) {
-          _updateStoredChannelMessage(
-            channelIndex,
-            m.messageId,
-            (cur) => cur.copyWith(status: ChannelMessageStatus.failed),
-          );
           final plain = m.otpPlaintext;
           final key = '$channelIndex:$plain';
-          if (nack.group(1) == 'C' && plain != null) {
-            if (_nackRetryKeys.remove(key)) break;
+          final retry =
+              nack.group(1) == 'C' &&
+              plain != null &&
+              !_nackRetryKeys.contains(key);
+          if (retry) {
             _nackRetryKeys.add(key);
-            Timer(const Duration(seconds: 60), () => _nackRetryKeys.remove(key));
+            Timer(
+              const Duration(seconds: 60),
+              () => _nackRetryKeys.remove(key),
+            );
+            _updateStoredChannelMessage(
+              channelIndex,
+              m.messageId,
+              (cur) => cur.copyWith(status: ChannelMessageStatus.pending),
+            );
             Timer(
               Duration(
                 milliseconds: 2000 + _channelJitterRandom.nextInt(4000),
               ),
               () {
+                final list = _channelMessages[channelIndex];
+                if (list != null) {
+                  list.removeWhere((e) => e.messageId == m.messageId);
+                  unawaited(
+                    _channelMessageStore.saveChannelMessages(
+                      channelIndex,
+                      list,
+                    ),
+                  );
+                }
+                notifyListeners();
                 for (final c in _channels) {
                   if (c.index == channelIndex) {
-                    unawaited(sendChannelMessage(c, plain));
+                    unawaited(sendChannelMessage(c, plain!));
                     break;
                   }
                 }
               },
+            );
+          } else {
+            _nackRetryKeys.remove(key);
+            _updateStoredChannelMessage(
+              channelIndex,
+              m.messageId,
+              (cur) => cur.copyWith(status: ChannelMessageStatus.failed),
             );
           }
           break;
